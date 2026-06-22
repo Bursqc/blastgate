@@ -53,9 +53,11 @@ dependencies:
   # Open URLs in system browser (Windows/Linux/macOS desktop fallback for webview)
   url_launcher: ^6.3.1
 
-  # BLE WiFi provisioning (Android + iOS only — no Windows support)
-  # Wraps Espressif's standard BLE provisioning protocol; matches hub WiFiProv lib.
-  flutter_esp_ble_prov: ^0.1.4
+  # BLE WiFi provisioning — TEMPORARILY DISABLED until hub firmware has
+  # BLAST_BLE_PROV=1 (blocked by pioarduino toolchain). The package
+  # flutter_esp_ble_prov 0.1.7 also has an AGP 8 namespace bug that blocks
+  # Android builds. Will be reinstated once both are resolved.
+  # flutter_esp_ble_prov: ^0.1.4
   permission_handler: ^11.3.1
 
 
