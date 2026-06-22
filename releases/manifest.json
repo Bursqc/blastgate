@@ -1,8 +1,8 @@
 {
-  "version": "1.4.2",
-  "url": "https://github.com/Bursqc/blastgate/releases/download/v1.4.2/firmware.bin",
-  "size": 1936304,
-  "sha256": "0589716bbced7ead408a849dc2fdbaea8f15f4f5b483f6591717b7c376488fb7",
+  "version": "1.4.3",
+  "url": "https://github.com/Bursqc/blastgate/releases/download/v1.4.3/firmware.bin",
+  "size": 1936432,
+  "sha256": "099fe99fab80e708393e7fdf1ddab8ec4133373f9f40c1d09e4d6fa9256ddd2d",
   "minPrevVersion": "1.0.0",
-  "changelog": "v1.4.2 — BLE prov starts cleanly\n- Explicitly erase WiFi creds from both NVS namespaces (blastgate + nvs.net80211) before BLE start\n- v1.4.0/1.4.1 silently failed: saved creds in our blastgate namespace raced with net_tick reconnect, so BLE never advertised"
+  "changelog": "v1.4.3 — BLE prov via reboot (avoids WiFi/BT race)\n- /wifi_prov now sets ble_prov_pending=true in NVS and restarts the hub\n- On boot, ble_prov_pending flag triggers BLE-only mode (no WiFi STA init)\n- Eliminates the race where net_tick reconnects to STA while BLE is trying to start\n- After successful BLE pairing, new WiFi creds are saved by the network_provisioning manager"
 }

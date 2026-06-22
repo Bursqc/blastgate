@@ -37,7 +37,7 @@ static inline void invalidateStatusCache();
 
 // ---------------- FIRMWARE VERSION ----------------
 #ifndef FW_VERSION
-#define FW_VERSION "1.4.2-dev"
+#define FW_VERSION "1.4.3-dev"
 #endif
 #define FW_BUILD __DATE__ " " __TIME__
 #define PROTO_VER "1.0"
@@ -52,6 +52,7 @@ static String g_otaToken;  // loaded from NVS at boot
 #if BLAST_BLE_PROV
 static String   g_provPop;
 static volatile bool g_provActive = false;
+static volatile bool g_skipStaInit = false;  // set when booting into BLE prov
 #else
 // Stub: prov is never active in builds without BLE. Keeps STATUS JSON valid.
 static const bool g_provActive = false;
@@ -1214,16 +1215,13 @@ static void handleUdp() {
 
   if (msg == "WIFI_PROV") {
 #if BLAST_BLE_PROV
-    // Start BLE provisioning on demand. Mobile app then scans for PROV_BG_XXXX
-    // and pushes SSID/pass over BLE using Espressif's standard protocol.
-    if (g_provActive) {
-      udpReply(rip, rport, "OK already_active");
-    } else {
-      startBleProvisioning();
-      char r[64];
-      snprintf(r, sizeof(r), "OK WIFI_PROV started pop=%s", g_provPop.c_str());
-      udpReply(rip, rport, r);
-    }
+    // Schedule a reboot into BLE prov mode (avoids race between WiFi STA
+    // reconnect and BLE start when both share the radio).
+    prefs.begin("blastgate", false);
+    prefs.putBool("ble_prov_pending", true);
+    prefs.end();
+    udpReply(rip, rport, "OK WIFI_PROV pending — restarting into BLE mode");
+    restartSoon(400);
 #else
     udpReply(rip, rport, "ERR BLE not compiled in (see BLAST_BLE_PROV)");
 #endif
@@ -1882,20 +1880,23 @@ static void setupHttpServer() {
   });
 
 #if BLAST_BLE_PROV
-  // POST /wifi_prov — start BLE provisioning. Returns the PoP and service name
-  // so the app can connect without scanning if the user already knows the device.
+  // POST /wifi_prov — schedule a reboot into BLE prov mode.
+  // We reboot rather than start BLE in-flight because the WiFi STA reconnect
+  // logic races with the BLE start (both want the radio + saved creds in NVS).
+  // After reboot the hub starts BLE before bringing up STA, advertising as
+  // PROV_BG_XXXX. App pairs, manager saves new creds, hub reboots into STA
+  // mode with the new WiFi.
   httpServer.on("/wifi_prov", HTTP_POST, []() {
     httpCors(httpServer);
-    if (g_provActive) {
-      httpServer.send(200, "application/json",
-        "{\"ok\":true,\"active\":true,\"already\":true}");
-      return;
-    }
-    startBleProvisioning();
+    prefs.begin("blastgate", false);
+    prefs.putBool("ble_prov_pending", true);
+    prefs.end();
     String svc = makeProvServiceName();
-    String body = "{\"ok\":true,\"active\":true,\"service\":\"" + svc +
+    String body = "{\"ok\":true,\"reboot\":true,\"service\":\"" + svc +
                   "\",\"pop\":\"" + g_provPop + "\"}";
     httpServer.send(200, "application/json", body);
+    delay(400);
+    ESP.restart();
   });
 
   // POST /prov_pop_set — rotate PoP code (8+ chars). Body: {"old":"...","new":"..."}
@@ -2070,6 +2071,13 @@ void setup() {
     prefs.putString("prov_pop", g_provPop);
     Serial.println("[PROV] No PoP in NVS — seeded default. CHANGE via /prov_pop_set!");
   }
+  // Check if a previous run scheduled us to boot into BLE prov mode
+  // (UDP WIFI_PROV / HTTP /wifi_prov sets this flag then restarts).
+  if (prefs.getBool("ble_prov_pending", false)) {
+    prefs.remove("ble_prov_pending");
+    g_skipStaInit = true;
+    Serial.println("[PROV] booting into BLE prov mode (skipping STA init)");
+  }
 #endif
   prefs.end();
   Serial.printf("[FW] version=%s build=%s\n", FW_VERSION, FW_BUILD);
@@ -2115,6 +2123,14 @@ void setup() {
 
   startEthFixed();
 
+#if BLAST_BLE_PROV
+  if (g_skipStaInit) {
+    // Booted into BLE prov mode — erase any leftover creds, start BLE.
+    // WiFi STA is intentionally NOT started so it can't race with BLE.
+    staForgetCreds();
+    startBleProvisioning();
+  } else
+#endif
   if (hasSavedCreds() || !isPlaceholderStaCreds()) {
     Serial.println("[STA] starting non-blocking WiFi connect");
     startStaWifi();
