@@ -37,7 +37,7 @@ static inline void invalidateStatusCache();
 
 // ---------------- FIRMWARE VERSION ----------------
 #ifndef FW_VERSION
-#define FW_VERSION "1.3.0-dev"
+#define FW_VERSION "1.4.0-dev"
 #endif
 #define FW_BUILD __DATE__ " " __TIME__
 #define PROTO_VER "1.0"
