@@ -53,7 +53,7 @@ class AppConfig(BaseModel):
 
     # OTA — where to look for new firmware. Default = GitHub Releases manifest.
     # Change this if you self-host releases.
-    ota_manifest_url: str = "https://raw.githubusercontent.com/REPO/blastgate/main/releases/manifest.json"
+    ota_manifest_url: str = "https://raw.githubusercontent.com/Bursqc/blastgate/main/releases/manifest.json"
     ota_token: str = "blastgate-change-me"     # must match hub's stored token
     ota_auto_check_s: int = Field(default=3600, ge=0)  # 0 = disable auto-check
 

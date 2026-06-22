@@ -26,7 +26,7 @@ class AppConfig {
     this.preferredHubIp = '',
     this.autoApDetect = true,
     this.showOfflineNodes = false,
-    this.otaManifestUrl = 'https://raw.githubusercontent.com/REPO/blastgate/main/releases/manifest.json',
+    this.otaManifestUrl = 'https://raw.githubusercontent.com/Bursqc/blastgate/main/releases/manifest.json',
     this.otaToken = 'blastgate-change-me',
   });
 
@@ -43,7 +43,7 @@ class AppConfig {
       autoApDetect: json['autoApDetect'] as bool? ?? true,
       showOfflineNodes: json['showOfflineNodes'] as bool? ?? false,
       otaManifestUrl: json['otaManifestUrl'] as String? ??
-          'https://raw.githubusercontent.com/REPO/blastgate/main/releases/manifest.json',
+          'https://raw.githubusercontent.com/Bursqc/blastgate/main/releases/manifest.json',
       otaToken: json['otaToken'] as String? ?? 'blastgate-change-me',
     );
   }
