@@ -1,8 +1,8 @@
 {
-  "version": "1.2.0",
-  "url": "https://github.com/Bursqc/blastgate/releases/download/v1.2.0/firmware.bin",
+  "version": "1.3.0",
+  "url": "https://github.com/Bursqc/blastgate/releases/download/v1.3.0/firmware.bin",
   "size": 649232,
-  "sha256": "7cf7c4a08b753bc95ce521a754c4eb15bba5c39486cf64f8f9e88e299c1b27a9",
+  "sha256": "1cc8d8a85d4b8800df46610248c480013c59fc8fbaddc2a91e54540a50dbde34",
   "minPrevVersion": "1.0.0",
-  "changelog": "v1.2.0 — first OTA-enabled release\n- OTA partition layout (min_spiffs.csv) — was huge_app, no OTA slots\n- POST /ota endpoint with X-OTA-Token auth\n- GET /version endpoint (version, build, uptime, freeHeap, otaPartition)\n- snprintf-based status JSON (no heap fragmentation)\n- Status JSON exposes protoVer + per-node config in-line\n- Cache-invalidate on state change for instant UI updates\n- UDP rebind 30s -> 10min (fewer dropped packets)\n- BLE provisioning code wired behind BLAST_BLE_PROV (gated off)\n- Captive portal /setup still works on AP (192.168.4.1)"
+  "changelog": "v1.3.0 — OTA flow end-to-end test\n- Bumped firmware identity to v1.3.0 to exercise the OTA round-trip\n- Identical binary to 1.2.0 otherwise (no functional changes)\n- Use this release to verify: download progress, SHA256 verify, upload to hub, reboot wait, post-reboot /version returning new version"
 }
