@@ -37,7 +37,7 @@ static inline void invalidateStatusCache();
 
 // ---------------- FIRMWARE VERSION ----------------
 #ifndef FW_VERSION
-#define FW_VERSION "1.4.0-dev"
+#define FW_VERSION "1.4.1-dev"
 #endif
 #define FW_BUILD __DATE__ " " __TIME__
 #define PROTO_VER "1.0"
@@ -992,7 +992,10 @@ static void startBleProvisioning() {
                 svc.c_str(), g_provPop.c_str());
 
   // FREE_BTDM = release BT controller memory after provisioning completes
-  // (saves ~25KB heap). reset_provisioned=false so saved creds are kept.
+  // (saves ~25KB heap).
+  // reset_provisioned=true is critical: when triggered manually via UDP/HTTP the
+  // user has explicitly asked to (re)provision. Without it, beginProvision sees
+  // existing creds in NVS and returns without ever starting BLE advertising.
   // arduino-esp32 3.x / IDF 5.x: NETWORK_PROV_* (network_provisioning manager).
   WiFiProv.beginProvision(
     NETWORK_PROV_SCHEME_BLE,
@@ -1002,7 +1005,7 @@ static void startBleProvisioning() {
     svc.c_str(),
     nullptr,  // service_key
     nullptr,  // uuid (auto)
-    false     // reset_provisioned
+    true      // reset_provisioned — force re-prov (user asked for it)
   );
   // Print QR to serial — handy when testing with esp-prov / phone app
   WiFiProv.printQR(svc.c_str(), g_provPop.c_str(), "ble");

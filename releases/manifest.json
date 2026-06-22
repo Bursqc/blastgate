@@ -1,8 +1,8 @@
 {
-  "version": "1.4.0",
-  "url": "https://github.com/Bursqc/blastgate/releases/download/v1.4.0/firmware.bin",
+  "version": "1.4.1",
+  "url": "https://github.com/Bursqc/blastgate/releases/download/v1.4.1/firmware.bin",
   "size": 1936256,
-  "sha256": "0867dbc1e4af0af71d1474943d8752f84c60ebc90c13d242d6114f21392c64c5",
+  "sha256": "0c2a73e47855aa460154db910a64c3feddaf1173d1aaa46b15e983dae3461519",
   "minPrevVersion": "1.0.0",
-  "changelog": "v1.4.0 — BLE WiFi provisioning enabled\n- Switched platform to pioarduino arduino-esp32 3.x + ESP-IDF 5.x\n- BLAST_BLE_PROV compiled in: hub advertises as PROV_BG_XXXX over BLE\n- New UDP command WIFI_PROV and HTTP POST /wifi_prov to start prov session\n- New HTTP POST /prov_pop_set to rotate PoP (proof-of-possession) code\n- New STATUS JSON field 'prov' indicates whether BLE prov is active\n- Default PoP is 'blastgate' — change via /prov_pop_set before exposing the hub\n- Flash usage: 98% (close to limit — future features may require a larger partition layout)"
+  "changelog": "v1.4.1 — BLE prov bug fix\n- WIFI_PROV / /wifi_prov now force reset_provisioned=true so BLE actually starts\n- v1.4.0 returned 'active:true' but skipped BLE advertising because hub already had saved creds\n- After upgrading, triggering BLE prov clears NVS creds and brings BLE up so the phone can pair"
 }
