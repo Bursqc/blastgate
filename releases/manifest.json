@@ -1,6 +1,6 @@
 {
   "version": "1.2.0",
-  "url": "https://github.com/Bursqc/blastgate/releases/download/v1.2.0/hub-firmware.bin",
+  "url": "https://github.com/Bursqc/blastgate/releases/download/v1.2.0/firmware.bin",
   "size": 649232,
   "sha256": "7cf7c4a08b753bc95ce521a754c4eb15bba5c39486cf64f8f9e88e299c1b27a9",
   "minPrevVersion": "1.0.0",
