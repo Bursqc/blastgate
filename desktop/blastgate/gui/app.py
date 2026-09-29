@@ -143,23 +143,7 @@ class App(tb.Window):
 
         self._apply_nodes(nodes_online)
 
-    # ---- Local config helpers ----
-    def _get_local_node(self, node_id: str) -> Dict[str, Any]:
-        """Get local node configuration"""
-        if self.cfg.nodes is None:
-            self.cfg.nodes = {}
-        return self.cfg.nodes.get(node_id, {}) or {}
-
-    def set_local_node(self, node_id: str, data: Dict[str, Any]):
-        """Set local node configuration"""
-        if self.cfg.nodes is None:
-            self.cfg.nodes = {}
-        cur = self.cfg.nodes.get(node_id, {}) or {}
-        cur.update(data or {})
-        self.cfg.nodes[node_id] = cur
-        save_config(self.cfg)
-        logger.info("Node config saved: %s", node_id)
-
+    # ---- Local state helpers ----
     def set_local_node_mode(self, node_id: str, mode: int):
         """Set local mode for node (0=AUTO, 1=MANUAL) - used by NodeDetail"""
         self._local_node_mode[node_id] = mode
@@ -169,16 +153,10 @@ class App(tb.Window):
         """Get local mode for node, or None if not set"""
         return self._local_node_mode.get(node_id)
 
-    def get_display_name(self, node_id: str, hub_name: str) -> str:
-        """Get display name for node (local override or hub name)"""
-        local = self._get_local_node(node_id)
-        override = (local.get("name") or "").strip()
-        return override if override else hub_name
-
     def rename_node(self, node_id: str, parent=None):
-        """Rename node dialog"""
+        """Rename node dialog (the name lives on the hub)"""
         parent = parent or self
-        current = self.get_display_name(node_id, "(unassigned)")
+        current = (self._last_nodes.get(node_id, {}).get("name") or "").strip()
         new_name = simpledialog.askstring(
             "Rename blastgate",
             f"New name for {node_id}:",
@@ -193,16 +171,13 @@ class App(tb.Window):
         if not new_name:
             return
 
-        self.set_local_node(node_id, {"name": new_name})
-        logger.info("Node renamed: %s -> %s", node_id, new_name)
-
         def ok():
             self._set_diag(f"Renamed on HUB [OK] ({node_id})")
-            logger.info("Hub rename successful: %s", node_id)
+            logger.info("Hub rename successful: %s -> %s", node_id, new_name)
 
         def err(e):
             logger.error("Hub rename failed: %s - %s", node_id, e)
-            self._set_diag(f"Saved local [OK] | HUB rename error: {e}")
+            self._set_diag(f"HUB rename error: {e}")
 
         self.net.send("rename", node_id, new_name, on_ok=ok, on_err=err)
 
@@ -457,8 +432,7 @@ class App(tb.Window):
         obj = self._tiles.get(nid) or self._create_tile(nid)
         tile: RoundedTile = obj["tile"]
 
-        hub_name = (node.get("name") or "").strip() or "(unassigned)"
-        name = self.get_display_name(nid, hub_name)
+        name = (node.get("name") or "").strip() or "(unassigned)"
 
         online = int(node.get("online", 0)) == 1
         override = int(node.get("override", 0))

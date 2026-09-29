@@ -676,11 +676,10 @@ class SettingsWindow(tb.Toplevel):
             restored_count = 0
 
             for node_id, node_config in nodes.items():
-                # Save to local config
-                self.app.set_local_node(node_id, {
-                    "name": node_config.get("name", ""),
-                    "threshold": node_config.get("threshold", 40.0),
-                })
+                # Names and thresholds live on the hub only
+                name = (node_config.get("name") or "").strip()
+                if name:
+                    self.net.send("rename", node_id, name)
 
                 # Try to apply to hub if node is online
                 threshold = node_config.get("threshold", 40.0)

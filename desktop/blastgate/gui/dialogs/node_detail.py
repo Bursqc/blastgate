@@ -173,7 +173,6 @@ class NodeDetail(tb.Toplevel):
         form.pack(fill="x")
 
         self.v_thr = tb.StringVar(value="40.0")
-        self.v_hyst = tb.StringVar(value="2.0")
         self.v_hold = tb.StringVar(value="5000")
         self.v_hb_open = tb.StringVar(value="2000")
         self.v_hb_close = tb.StringVar(value="2000")
@@ -190,10 +189,9 @@ class NodeDetail(tb.Toplevel):
             ttk.Label(form, text=hint, bootstyle=SECONDARY).grid(row=r, column=2, sticky="w", padx=12, pady=10)
 
         row_entry(0, "Threshold", self.v_thr, "Prag aktivacije (npr 40.0)")
-        row_entry(1, "Hysteresis", self.v_hyst, "Sprečava treperenje (npr 2.0)")
-        row_entry(2, "Gate hold (ms)", self.v_hold, "Gate ostaje OPEN nakon inactive")
-        row_entry(3, "H-bridge open (ms)", self.v_hb_open, "Motor trči pri otvaranju (npr 2000)")
-        row_entry(4, "H-bridge close (ms)", self.v_hb_close, "Motor trči pri zatvaranju (npr 2000)")
+        row_entry(1, "Gate hold (ms)", self.v_hold, "Gate ostaje OPEN nakon inactive")
+        row_entry(2, "H-bridge open (ms)", self.v_hb_open, "Motor trči pri otvaranju (npr 2000)")
+        row_entry(3, "H-bridge close (ms)", self.v_hb_close, "Motor trči pri zatvaranju (npr 2000)")
 
         form.grid_columnconfigure(2, weight=1)
 
@@ -284,41 +282,15 @@ class NodeDetail(tb.Toplevel):
         # Use NODECFG_GET to get actual config values from hub
         self.net.send("nodecfg_get", self.node_id, on_ok=on_config_received, on_err=on_config_err)
 
-    def _load_settings_from_hub_and_local(self, hub_node: Dict[str, Any]):
-        """
-        Load settings from hub and local config (one-time on window open).
-        Priority: local config > hub values > defaults
-        """
-        # Get local config for this node
-        local = self.app._get_local_node(self.node_id)
+    def _load_settings_from_hub(self, hub_node: Dict[str, Any]):
+        """Load settings from hub status (one-time on window open). The hub is the only source."""
+        thr = hub_node.get("threshold_on", 40.0)
+        hold = hub_node.get("gate_hold_ms", 5000)
 
-        # Threshold: prefer local, fallback to hub, then default
-        if local.get("threshold") is not None:
-            thr = local.get("threshold")
-        elif "threshold_on" in hub_node:
-            thr = hub_node.get("threshold_on", 40.0)
-        else:
-            thr = 40.0
-
-        # Hysteresis: only from local config (hub doesn't have this)
-        hyst = local.get("hyst", 2.0)
-
-        # Hold time: prefer local, fallback to hub, then default
-        if local.get("hold_ms") is not None:
-            hold = local.get("hold_ms")
-        elif "gate_hold_ms" in hub_node:
-            hold = hub_node.get("gate_hold_ms", 5000)
-        else:
-            hold = 5000
-
-        # Set values in UI
         self.v_thr.set(str(thr))
-        self.v_hyst.set(str(hyst))
         self.v_hold.set(str(hold))
 
-        logger.info("Settings loaded for %s: thr=%.1f, hyst=%.1f, hold=%d (local=%s)",
-                   self.node_id, float(thr), float(hyst), int(hold),
-                   "yes" if local else "no")
+        logger.info("Settings loaded for %s: thr=%.1f, hold=%d", self.node_id, float(thr), int(hold))
 
     def _on_mode_toggle(self, state: str):
         """Handle mode toggle (AUTO/MANUAL)"""
@@ -415,23 +387,9 @@ class NodeDetail(tb.Toplevel):
         self._update_controls_visibility()
 
         if gate == "close":
-            # CLOSE sequence: relay OFF first, then gate close after delay
-            self.var_msg.set("Relay OFF -> Gate CLOSE ...")
-            logger.info("CLOSE sequence: relay OFF first, then gate close")
-
-            def relay_ok():
-                self.var_msg.set("Relay OFF [OK], closing gate...")
-                logger.info("Relay OFF success, now closing gate")
-                # Now send gate close command
-                self._send_gate_close()
-
-            def relay_err(e):
-                logger.warning("Relay OFF failed: %s, closing gate anyway", e)
-                self.var_msg.set(f"Relay OFF failed: {e}, closing gate...")
-                # Still try to close gate even if relay failed
-                self._send_gate_close()
-
-            self.net.send("relay", "off", on_ok=relay_ok, on_err=relay_err)
+            # Hub decides the relay; RELAY off here would force it off for every gate for 30 s.
+            self.var_msg.set("Setting gate -> CLOSE ...")
+            self._send_gate_close()
         else:
             # OPEN: just send gate open command
             self.var_msg.set(f"Setting gate -> OPEN ...")
@@ -453,7 +411,7 @@ class NodeDetail(tb.Toplevel):
             self.net.send("gate", self.node_id, "open", on_ok=ok, on_err=err)
 
     def _send_gate_close(self):
-        """Send gate close command (called after relay OFF)"""
+        """Send gate close command"""
         def ok():
             self.var_msg.set("Gate -> CLOSE [OK]")
             logger.info("Gate set successfully: %s -> close", self.node_id)
@@ -485,7 +443,6 @@ class NodeDetail(tb.Toplevel):
         """Apply settings to hub"""
         try:
             thr = to_float(self.v_thr.get(), 40.0)
-            hyst = max(0.0, to_float(self.v_hyst.get(), 2.0))
             hold = max(0, to_int(self.v_hold.get(), 5000))
             hb_open = max(100, to_int(self.v_hb_open.get(), 2000))
             hb_close = max(100, to_int(self.v_hb_close.get(), 2000))
@@ -493,9 +450,9 @@ class NodeDetail(tb.Toplevel):
             self.var_settings_msg.set(f"Invalid input: {e}")
             return
 
+        # relay_hold_ms is not sent: the hub stores it but no logic uses it.
         payload = {
             "threshold_on": thr,
-            "relay_hold_ms": hold,
             "gate_hold_ms": hold,
             "hbridge_open_ms": hb_open,
             "hbridge_close_ms": hb_close,
@@ -506,14 +463,6 @@ class NodeDetail(tb.Toplevel):
 
         def ok():
             self.var_settings_msg.set("Applied [OK]")
-            # Also save locally for Python AUTO controller
-            self.app.set_local_node(self.node_id, {
-                "threshold": thr,
-                "hyst": hyst,
-                "hold_ms": hold,
-                "hbridge_open_ms": hb_open,
-                "hbridge_close_ms": hb_close,
-            })
             logger.info("Settings applied successfully: %s", self.node_id)
 
         def err(e):
@@ -593,9 +542,7 @@ class NodeDetail(tb.Toplevel):
                     self._on_close()
                     return
 
-                hub_name = (hit.get("name") or "").strip() or "(unassigned)"
-                name = self.app.get_display_name(self.node_id, hub_name)
-                self.var_name.set(name)
+                self.var_name.set((hit.get("name") or "").strip() or "(unassigned)")
 
                 # Get mode and override from hub
                 node_mode = int(hit.get("mode", 0))  # 0=AUTO, 1=MANUAL
@@ -620,7 +567,7 @@ class NodeDetail(tb.Toplevel):
                 # Load settings only once (first time we have hub data)
                 if not self._settings_loaded:
                     self._settings_loaded = True
-                    self._load_settings_from_hub_and_local(hit)
+                    self._load_settings_from_hub(hit)
 
                 # Only sync override from hub, NOT mode (mode is controlled locally)
                 # Hub's mode field is unreliable - it gets reset by NODE_PING

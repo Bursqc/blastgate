@@ -413,9 +413,6 @@ class CalibrationWizard(tb.Toplevel):
 
         self.net.send("cfg", self.node_id, payload, on_ok=on_ok, on_err=on_err)
 
-        # Also save to local config
-        self.app.set_local_node(self.node_id, {"threshold": self._recommended_threshold})
-
     def _close(self):
         """Close wizard"""
         self._stop = True
