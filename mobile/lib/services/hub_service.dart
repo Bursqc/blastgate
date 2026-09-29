@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/app_config.dart';
 import '../models/hub_status.dart';
 import '../models/node_status.dart';
+import '../ui/state.dart';
 
 /// Connection status enum
 enum ConnectionStatus {
@@ -24,7 +25,16 @@ class HubService extends ChangeNotifier {
   Timer? _pollTimer;
   RawDatagramSocket? _socket;
   RawDatagramSocket? _broadcastSocket;  // HUB_UPDATE listener
-  bool _commandInFlight = false;        // Guard against concurrent _sendCommand calls
+  Future<void> _cmdTail = Future.value(); // commands run one at a time, in order
+  int _cmdPending = 0;
+  int _misses = 0;                        // consecutive STATUS timeouts
+
+  // Raw STATUS JSON (same map the desktop app works with) + derived events
+  Map<String, dynamic> _raw = {};
+  DateTime? _updatedAt;
+  final List<HubEvent> events = [];
+  static const int maxEvents = 500;
+  static const int missesBeforeOffline = 3;
 
   // Getters
   AppConfig get config => _config;
@@ -39,6 +49,36 @@ class HubService extends ChangeNotifier {
 
   bool get isConnected => _connectionStatus == ConnectionStatus.connected;
   bool get isOverdrive => _hubStatus?.manualOverdrive ?? false;
+
+  Map<String, dynamic> get status => _raw;
+  DateTime? get updatedAt => _updatedAt;
+  bool get lockout => _raw.isNotEmpty && toInt(_raw['manualOverdrive']) == 1;
+  bool get searching => _connectionStatus == ConnectionStatus.connecting;
+
+  Map<String, dynamic>? node(String id) {
+    for (final n in nodesOf(_raw)) {
+      if (n['id'] == id) return n;
+    }
+    return null;
+  }
+
+  void addEvent(String tone, String text) {
+    events.add(HubEvent(DateTime.now(), tone, text));
+    if (events.length > maxEvents) events.removeRange(0, events.length - maxEvents);
+    notifyListeners();
+  }
+
+  void clearEvents() {
+    events.clear();
+    notifyListeners();
+  }
+
+  void _setStatus(Map<String, dynamic> next) {
+    final evs = diffEvents(_raw, next);
+    _raw = next;
+    events.addAll(evs);
+    if (events.length > maxEvents) events.removeRange(0, events.length - maxEvents);
+  }
 
   /// Initialize the service
   Future<void> init() async {
@@ -109,6 +149,13 @@ class HubService extends ChangeNotifier {
       if (configStr != null) {
         _config = AppConfig.fromJson(jsonDecode(configStr));
       }
+      // Migration: replace the v1 placeholder OTA URL with the current default.
+      // Earlier dev builds saved "REPO/blastgate" before the real repo was known.
+      if (_config.otaManifestUrl.contains('REPO/blastgate')) {
+        debugPrint('[migration] OTA manifest URL had placeholder REPO — resetting to default');
+        _config.otaManifestUrl = AppConfig().otaManifestUrl;
+        await saveConfig();
+      }
     } catch (e) {
       debugPrint('Error loading config: $e');
     }
@@ -153,11 +200,23 @@ class HubService extends ChangeNotifier {
     _pollTimer = null;
   }
 
-  /// Send UDP command and get response
-  Future<String?> _sendCommand(String command, {Duration? timeout}) async {
-    // Drop concurrent calls — poll timer may fire while a user command is in flight
-    if (_commandInFlight) return null;
-    _commandInFlight = true;
+  /// Send UDP command and get response. Commands are queued (never dropped),
+  /// so a button press is not lost when a STATUS poll is in flight.
+  Future<String?> _sendCommand(String command, {Duration? timeout}) {
+    final prev = _cmdTail;
+    final done = Completer<void>();
+    _cmdTail = done.future;
+    _cmdPending++;
+    return prev.then((_) => _sendCommandNow(command, timeout: timeout)).whenComplete(() {
+      _cmdPending--;
+      done.complete();
+    });
+  }
+
+  /// Public raw command: returns the hub reply or null on timeout.
+  Future<String?> command(String cmd) => _sendCommand(cmd);
+
+  Future<String?> _sendCommandNow(String command, {Duration? timeout}) async {
     try {
       final targetIp = _config.effectiveHubIp;
       final targetPort = _config.udpPort;
@@ -206,13 +265,13 @@ class HubService extends ChangeNotifier {
       _socket?.close();
       _socket = null;
       return null;
-    } finally {
-      _commandInFlight = false;
     }
   }
 
   /// Fetch hub status
   Future<void> fetchStatus() async {
+    // A user command is queued/in flight — skip this poll, the next one follows shortly
+    if (_cmdPending > 0) return;
     try {
       if (_connectionStatus != ConnectionStatus.connected) {
         _connectionStatus = ConnectionStatus.connecting;
@@ -222,8 +281,14 @@ class HubService extends ChangeNotifier {
       final response = await _sendCommand('STATUS');
 
       if (response == null) {
-        _connectionStatus = ConnectionStatus.disconnected;
-        _lastError = 'No response from hub';
+        // One lost UDP packet is not a lost hub: keep the last status for a few polls
+        _misses++;
+        if (_misses >= missesBeforeOffline || _raw.isEmpty) {
+          _connectionStatus = ConnectionStatus.disconnected;
+          _lastError = 'No response from hub';
+          if (_raw.isNotEmpty) _setStatus({});
+          _hubStatus = null;
+        }
         notifyListeners();
         return;
       }
@@ -232,6 +297,9 @@ class HubService extends ChangeNotifier {
       try {
         final json = jsonDecode(response) as Map<String, dynamic>;
         _hubStatus = HubStatus.fromJson(json);
+        _setStatus(json);
+        _updatedAt = DateTime.now();
+        _misses = 0;
         _connectionStatus = ConnectionStatus.connected;
         _lastError = '';
       } catch (e) {
@@ -259,9 +327,20 @@ class HubService extends ChangeNotifier {
     return false;
   }
 
-  /// Rename a node
+  /// Set node mode: 'auto' or 'manual'
+  Future<bool> setMode(String nodeId, String mode) async {
+    final response = await _sendCommand('NODEMODE id=$nodeId mode=$mode');
+    if (response != null && response.contains('OK')) {
+      await fetchStatus();
+      return true;
+    }
+    return false;
+  }
+
+  /// Rename a node (hub args are space-separated — spaces become '_', same as desktop)
   Future<bool> renameNode(String nodeId, String newName) async {
-    final command = 'ASSIGN id=$nodeId name=$newName';
+    final safe = newName.trim().replaceAll('"', "'").replaceAll(' ', '_');
+    final command = 'ASSIGN id=$nodeId name=$safe';
     final response = await _sendCommand(command);
     if (response != null && response.contains('OK')) {
       await fetchStatus();
@@ -280,10 +359,7 @@ class HubService extends ChangeNotifier {
   }) async {
     final parts = <String>['NODECFG_SET id=$nodeId'];
     if (threshold != null) parts.add('threshold_on=$threshold');
-    if (holdMs != null) {
-      parts.add('relay_hold_ms=$holdMs');
-      parts.add('gate_hold_ms=$holdMs');
-    }
+    if (holdMs != null) parts.add('gate_hold_ms=$holdMs');
     if (hbridgeOpenMs != null) parts.add('hbridge_open_ms=$hbridgeOpenMs');
     if (hbridgeCloseMs != null) parts.add('hbridge_close_ms=$hbridgeCloseMs');
 
@@ -312,12 +388,18 @@ class HubService extends ChangeNotifier {
     return null;
   }
 
-  /// Set relay state
-  Future<bool> setRelay(String state) async {
-    // state: 'on', 'off', 'auto'
-    final command = 'RELAY $state';
-    final response = await _sendCommand(command);
-    return response != null && response.contains('OK');
+  /// Set relay state: 'on', 'off', 'auto'. Returns null on success, else the reason.
+  Future<String?> setRelay(String state) async {
+    final response = await _sendCommand('RELAY $state');
+    if (response == null) return 'Hub ne odgovara';
+    if (response.contains('OK')) {
+      await fetchStatus();
+      return null;
+    }
+    if (response.contains('no gate open')) {
+      return 'Hub ne pali usisivač dok nijedan zatvarač nije otvoren.';
+    }
+    return response.trim();
   }
 
   /// Refresh nodes

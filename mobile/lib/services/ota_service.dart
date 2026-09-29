@@ -115,10 +115,19 @@ class OtaService {
   }
 
   /// GET manifest.json from update server.
+  /// Adds a cache-bust query param + no-cache headers so GitHub's raw CDN
+  /// (max-age=300) doesn't keep us pinned to an old manifest after a release.
   Future<OtaManifest> fetchRemoteManifest(String manifestUrl) async {
-    final resp = await http
-        .get(Uri.parse(manifestUrl), headers: {'User-Agent': 'BlastgateMobile/1.0'})
-        .timeout(_manifestTimeout);
+    final sep = manifestUrl.contains('?') ? '&' : '?';
+    final bustedUrl = '$manifestUrl${sep}t=${DateTime.now().millisecondsSinceEpoch}';
+    final resp = await http.get(
+      Uri.parse(bustedUrl),
+      headers: {
+        'User-Agent': 'BlastgateMobile/1.0',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+      },
+    ).timeout(_manifestTimeout);
     if (resp.statusCode != 200) {
       throw Exception('manifest returned ${resp.statusCode}');
     }

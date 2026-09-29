@@ -10,6 +10,7 @@ class AppConfig {
   String preferredHubIp;
   bool autoApDetect;
   bool showOfflineNodes;
+  String theme;         // 'dark' | 'light' — same choice as the desktop app
 
   // OTA settings — match desktop AppConfig
   String otaManifestUrl;
@@ -26,6 +27,7 @@ class AppConfig {
     this.preferredHubIp = '',
     this.autoApDetect = true,
     this.showOfflineNodes = false,
+    this.theme = 'dark',
     this.otaManifestUrl = 'https://raw.githubusercontent.com/Bursqc/blastgate/main/releases/manifest.json',
     this.otaToken = 'blastgate-change-me',
   });
@@ -42,6 +44,7 @@ class AppConfig {
       preferredHubIp: json['preferredHubIp'] as String? ?? '',
       autoApDetect: json['autoApDetect'] as bool? ?? true,
       showOfflineNodes: json['showOfflineNodes'] as bool? ?? false,
+      theme: json['theme'] as String? ?? 'dark',
       otaManifestUrl: json['otaManifestUrl'] as String? ??
           'https://raw.githubusercontent.com/Bursqc/blastgate/main/releases/manifest.json',
       otaToken: json['otaToken'] as String? ?? 'blastgate-change-me',
@@ -60,6 +63,7 @@ class AppConfig {
       'preferredHubIp': preferredHubIp,
       'autoApDetect': autoApDetect,
       'showOfflineNodes': showOfflineNodes,
+      'theme': theme,
       'otaManifestUrl': otaManifestUrl,
       'otaToken': otaToken,
     };
