@@ -19,9 +19,27 @@
 #include <WebServer.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_random.h>
+#include <mbedtls/sha256.h>
+#include <blastgate_proto.h>
 
 // Forward declaration — defined later in this file.
 static inline void invalidateStatusCache();
+
+// Set to 1 to keep the legacy UDP node transport (NODE_HELLO / NODE_VALUE / GATE ...)
+// next to ESP-NOW, so nodes can be migrated one at a time.
+#ifndef BLAST_TRANSPORT_UDP
+#define BLAST_TRANSPORT_UDP 0
+#endif
+
+// ESP-NOW TX power in 0.25 dBm units (80 = 20 dBm)
+#ifdef EXTERNAL_ANTENNA
+#define BG_TX_POWER 68
+#else
+#define BG_TX_POWER 80
+#endif
 
 // Set to 1 to compile in BLE WiFi provisioning. Needs:
 //  - pioarduino arduino-esp32 3.x platform (penv install fix), OR
@@ -37,7 +55,7 @@ static inline void invalidateStatusCache();
 
 // ---------------- FIRMWARE VERSION ----------------
 #ifndef FW_VERSION
-#define FW_VERSION "1.4.3-dev"
+#define FW_VERSION "1.5.0-dev"
 #endif
 #define FW_BUILD __DATE__ " " __TIME__
 #define PROTO_VER "1.0"
@@ -77,8 +95,17 @@ static void ledWrite(bool on) {
   else                        digitalWrite(STATUS_LED_PIN, on ? LOW  : HIGH);
 }
 
+static uint32_t g_pairUntilMs = 0;   // ESP-NOW pairing window end (0 = closed)
+static inline bool pairingActive() { return g_pairUntilMs && (int32_t)(g_pairUntilMs - millis()) > 0; }
+
 static void ledUpdate() {
   uint32_t now = millis();
+
+  if (pairingActive()) {
+    // Pairing window: very fast blink 80ms
+    if (now - led_t0 >= 80) { led_t0 = now; led_state = !led_state; ledWrite(led_state); }
+    return;
+  }
 
   if (!hub_ready) {
     // Booting: fast blink 100ms
@@ -205,7 +232,29 @@ struct NodeState {
 
   uint8_t   savedMode          = MODE_AUTO;
   uint8_t   savedGateOverride  = GATE_AUTO;
+
+  // ---- ESP-NOW transport ----
+  uint8_t   transport          = 0;      // TRANSPORT_*
+  uint8_t   mac[6]             = {0};
+  int8_t    rssi               = 0;      // RSSI of last frame from this node (hub side)
+  int8_t    nodeRssi           = 0;      // RSSI the node reports for hub frames
+  char      fw[BG_FW_LEN]      = {0};
+  uint8_t   actuator           = BG_ACT_BOTH;
+  bool      endstops           = false;  // config: Rev B end switches fitted
+  uint8_t   endstopBits        = 0;      // live state from DATA
+  uint8_t   gateState          = BG_GATE_CLOSED;
+  uint8_t   err                = 0;      // BG_ERR_* from DATA
+  uint32_t  nodeUptime         = 0;
+  uint16_t  lastRxSeq          = 0;
+  bool      lastRxSeqValid     = false;
+  uint8_t   btnCount           = 0;
+  bool      btnCountValid      = false;
+  uint32_t  txFails            = 0;      // CMD/CONFIG that never got an ACK
 };
+
+static const uint8_t TRANSPORT_NONE   = 0;
+static const uint8_t TRANSPORT_UDP    = 1;
+static const uint8_t TRANSPORT_ESPNOW = 2;
 
 static NodeState nodes[MAX_NODES];
 
@@ -260,14 +309,15 @@ static bool forgetNameForId(const String& id) {
 // ---------------- NODE CONFIG NVS ----------------
 static void saveNodeConfigToNVS(const String& id, float threshold, uint32_t relay_hold,
                                  uint32_t gate_hold, uint8_t override_state,
-                                 uint32_t hb_open = 2000, uint32_t hb_close = 2000) {
+                                 uint32_t hb_open = 2000, uint32_t hb_close = 2000,
+                                 bool endstops = false) {
   if (!id.length()) return;
   prefs.begin("node_cfg", false);
   String key = id;
   key.replace(":", "");
   String cfg = String(threshold, 3) + "," + String(relay_hold) + "," +
                String(gate_hold) + "," + String(override_state) + "," +
-               String(hb_open) + "," + String(hb_close);
+               String(hb_open) + "," + String(hb_close) + "," + String(endstops ? 1 : 0);
   prefs.putString(key.c_str(), cfg);
   prefs.end();
   Serial.printf("[NVS] Saved config for %s: %s\n", id.c_str(), cfg.c_str());
@@ -275,7 +325,7 @@ static void saveNodeConfigToNVS(const String& id, float threshold, uint32_t rela
 
 static bool loadNodeConfigFromNVS(const String& id, float& threshold, uint32_t& relay_hold,
                                    uint32_t& gate_hold, uint8_t& override_state,
-                                   uint32_t& hb_open, uint32_t& hb_close) {
+                                   uint32_t& hb_open, uint32_t& hb_close, bool& endstops) {
   if (!id.length()) return false;
   prefs.begin("node_cfg", true);
   String key = id;
@@ -299,7 +349,9 @@ static bool loadNodeConfigFromNVS(const String& id, float& threshold, uint32_t& 
     int idx5 = cfg.indexOf(',', idx4 + 1);
     if (idx5 > 0) {
       hb_open  = cfg.substring(idx4 + 1, idx5).toInt();
-      hb_close = cfg.substring(idx5 + 1).toInt();
+      hb_close = cfg.substring(idx5 + 1).toInt();   // toInt() stops at the next ','
+      int idx6 = cfg.indexOf(',', idx5 + 1);
+      if (idx6 > 0) endstops = cfg.substring(idx6 + 1).toInt() != 0;
     }
   } else {
     override_state = cfg.substring(idx3 + 1).toInt();
@@ -357,9 +409,14 @@ static const char* netStateName(NetState s) {
   }
 }
 
+static void staSetEnabled(bool on);   // defined after startStaWifi()
+
 static void netEnter(NetState next) {
   if (g_net == next) return;
   Serial.printf("[NET] %s → %s\n", netStateName(g_net), netStateName(next));
+  // ETH uplink: STA off so the radio stays on the fixed ESP-NOW channel.
+  if (next == NET_ETH_ACTIVE)       staSetEnabled(false);
+  else if (g_net == NET_ETH_ACTIVE) staSetEnabled(true);
   g_net        = next;
   g_netEnterMs = millis();
   g_ethLostMs  = 0;
@@ -367,7 +424,8 @@ static void netEnter(NetState next) {
 }
 
 // ---------------- HELPERS ----------------
-static void relayWrite(bool on) { digitalWrite(RELAY_PIN, on ? HIGH : LOW); }
+static bool g_relayOn = false;   // mirrored into ESP-NOW HEARTBEAT
+static void relayWrite(bool on) { g_relayOn = on; digitalWrite(RELAY_PIN, on ? HIGH : LOW); }
 
 static void manualLedWrite(bool on) {
   if (MANUAL_LED_ACTIVE_HIGH) digitalWrite(MANUAL_LED_PIN, on ? HIGH : LOW);
@@ -423,13 +481,15 @@ static int allocNode(const String& id) {
       float    saved_thr;
       uint32_t saved_rh, saved_gh, saved_hbo = 2000, saved_hbc = 2000;
       uint8_t  saved_ovr;
-      if (loadNodeConfigFromNVS(id, saved_thr, saved_rh, saved_gh, saved_ovr, saved_hbo, saved_hbc)) {
+      bool     saved_end = false;
+      if (loadNodeConfigFromNVS(id, saved_thr, saved_rh, saved_gh, saved_ovr, saved_hbo, saved_hbc, saved_end)) {
         nodes[i].threshold_on    = saved_thr;
         nodes[i].relay_hold_ms   = saved_rh;
         nodes[i].gate_hold_ms    = saved_gh;
         nodes[i].gateOverride    = saved_ovr;
         nodes[i].hbridge_open_ms  = saved_hbo;
         nodes[i].hbridge_close_ms = saved_hbc;
+        nodes[i].endstops         = saved_end;
         Serial.printf("[NODE] Restored config from NVS for %s\n", id.c_str());
       } else {
         Serial.printf("[NODE] No saved config for %s - using defaults\n", id.c_str());
@@ -490,18 +550,25 @@ static void sendBroadcast(const IPAddress& bcast, const String& m) {
 }
 
 // ---------------- AP ENFORCE ----------------
+// STA is switched off while ETH is the uplink, so the radio stays on the fixed
+// ESP-NOW channel instead of following a router.
+static bool    g_staEnabled = true;
+static uint8_t g_espnowCh   = 1;     // fixed channel (NVS "esn_ch") when STA is off
+static bool    g_bleMode    = false; // BLE provisioning owns STA — don't toggle it
+
 static void ensureAP() {
+  const wifi_mode_t mode = g_staEnabled ? WIFI_AP_STA : WIFI_AP;
   WiFi.setSleep(false);
-  WiFi.mode(WIFI_AP_STA);
+  WiFi.mode(mode);
   WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
-  bool ok = WiFi.softAP(AP_SSID, AP_PASS);
+  bool ok = WiFi.softAP(AP_SSID, AP_PASS, g_espnowCh);
   if (!ok) {
     delay(200);
     WiFi.softAPdisconnect(true);
     delay(200);
-    WiFi.mode(WIFI_AP_STA);
+    WiFi.mode(mode);
     WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
-    ok = WiFi.softAP(AP_SSID, AP_PASS);
+    ok = WiFi.softAP(AP_SSID, AP_PASS, g_espnowCh);
   }
   Serial.printf("[AP] %s  SSID=%s  IP=%s  mode=%d\n",
     ok ? "OK" : "FAIL", AP_SSID,
@@ -593,14 +660,267 @@ static void factoryReset() {
   prefs.clear();
   prefs.end();
 
+  // Erase ESP-NOW pairing (paired MACs + network key) — every node must re-pair
+  prefs.begin("bg_pair", false);
+  prefs.clear();
+  prefs.end();
+
   Serial.println("[RESET] Done -> restarting");
   restartSoon(500);
+}
+
+// ===============================
+// ESP-NOW TRANSPORT (blastgate_proto.h)
+// ===============================
+// Nodes talk to the hub over ESP-NOW on the hub's current radio channel:
+//  - STA connected  -> router's channel (AP follows it)
+//  - ETH uplink     -> STA off, fixed channel g_espnowCh (NVS "esn_ch")
+// Frames are HMAC-signed with a 16-byte network key handed out during pairing.
+// Only MACs in the paired list (NVS "bg_pair", max MAX_NODES) are accepted.
+
+static const uint8_t BCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static const uint8_t ZERO_KEY[BG_KEY_LEN] = {0};
+
+static bool     g_espnowUp = false;
+static uint8_t  g_netKey[BG_KEY_LEN];
+static uint8_t  g_hubMac[6];            // AP interface MAC (ESP-NOW frames go out on AP)
+static uint16_t g_hubSeq = 0;
+
+static uint8_t  g_pairMacs[MAX_NODES][6];
+static int      g_pairCount = 0;
+
+struct EspRxItem { uint8_t src[6]; int8_t rssi; int len; uint8_t data[BG_MAX_FRAME]; };
+static QueueHandle_t g_espRxQueue = nullptr;
+
+// One outstanding CMD and one outstanding CONFIG per node; newer replaces older.
+struct PendingTx {
+  bool     active = false;
+  uint16_t seq    = 0;
+  uint8_t  tries  = 0;
+  uint32_t sentMs = 0;
+  size_t   len    = 0;
+  uint8_t  buf[BG_MAX_FRAME];
+};
+static PendingTx g_pendCmd[MAX_NODES];
+static PendingTx g_pendCfg[MAX_NODES];
+static const uint8_t  TX_MAX_RETRY    = 3;
+static const uint32_t TX_ACK_WAIT_MS  = 250;
+
+static String idFromMac(const uint8_t mac[6]) {
+  char id[16];
+  snprintf(id, sizeof(id), "BG-%02X%02X%02X", mac[3], mac[4], mac[5]);
+  return String(id);
+}
+
+static String macToStr(const uint8_t mac[6]) {
+  char s[18];
+  snprintf(s, sizeof(s), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(s);
+}
+
+static bool pairIsKnown(const uint8_t mac[6]) {
+  for (int i = 0; i < g_pairCount; i++) if (memcmp(g_pairMacs[i], mac, 6) == 0) return true;
+  return false;
+}
+
+static void pairSave() {
+  prefs.begin("bg_pair", false);
+  prefs.putUChar("n", (uint8_t)g_pairCount);
+  prefs.putBytes("macs", g_pairMacs, g_pairCount * 6);
+  prefs.end();
+}
+
+static bool pairAdd(const uint8_t mac[6]) {
+  if (pairIsKnown(mac)) return true;
+  if (g_pairCount >= MAX_NODES) return false;
+  memcpy(g_pairMacs[g_pairCount++], mac, 6);
+  pairSave();
+  Serial.printf("[PAIR] added %s (%d/%d)\n", macToStr(mac).c_str(), g_pairCount, MAX_NODES);
+  return true;
+}
+
+static bool pairRemove(const uint8_t mac[6]) {
+  for (int i = 0; i < g_pairCount; i++) {
+    if (memcmp(g_pairMacs[i], mac, 6) != 0) continue;
+    for (int j = i; j < g_pairCount - 1; j++) memcpy(g_pairMacs[j], g_pairMacs[j + 1], 6);
+    g_pairCount--;
+    pairSave();
+    if (esp_now_is_peer_exist(mac)) esp_now_del_peer(mac);
+    return true;
+  }
+  return false;
+}
+
+// Load paired MACs + network key; generate the key on first boot.
+static void pairLoad() {
+  prefs.begin("bg_pair", false);
+  g_pairCount = prefs.getUChar("n", 0);
+  if (g_pairCount > MAX_NODES) g_pairCount = 0;
+  if (g_pairCount) prefs.getBytes("macs", g_pairMacs, g_pairCount * 6);
+  if (prefs.getBytes("key", g_netKey, BG_KEY_LEN) != BG_KEY_LEN) {
+    esp_fill_random(g_netKey, BG_KEY_LEN);
+    prefs.putBytes("key", g_netKey, BG_KEY_LEN);
+    Serial.println("[PAIR] generated new network key");
+  }
+  prefs.end();
+  Serial.printf("[PAIR] %d paired node(s)\n", g_pairCount);
+}
+
+static void startPairing() {
+  g_pairUntilMs = millis() + 60000;
+  if (!g_pairUntilMs) g_pairUntilMs = 1;
+  Serial.println("[PAIR] pairing window open (60s)");
+  invalidateStatusCache();
+}
+
+static uint8_t currentChannel() {
+  uint8_t ch = 0;
+  wifi_second_chan_t sc;
+  if (esp_wifi_get_channel(&ch, &sc) != ESP_OK) ch = 0;
+  return ch;
+}
+
+static void espEnsurePeer(const uint8_t mac[6]) {
+  if (esp_now_is_peer_exist(mac)) return;
+  esp_now_peer_info_t p = {};
+  memcpy(p.peer_addr, mac, 6);
+  p.channel = 0;              // follow the current channel
+  p.ifidx   = WIFI_IF_AP;     // AP is always up, STA may be switched off
+  p.encrypt = false;
+  esp_now_add_peer(&p);
+}
+
+static void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (!g_espRxQueue || len <= 0 || len > BG_MAX_FRAME) return;
+  EspRxItem it;
+  memcpy(it.src, info->src_addr, 6);
+  it.rssi = info->rx_ctrl ? (int8_t)info->rx_ctrl->rssi : 0;
+  it.len  = len;
+  memcpy(it.data, data, len);
+  xQueueSend(g_espRxQueue, &it, 0);
+}
+
+static size_t espBuild(uint8_t* out, uint8_t type, const void* payload, size_t plen) {
+  return bg_build(out, type, ++g_hubSeq, g_hubMac, payload, plen, g_netKey);
+}
+
+static void espSendRaw(const uint8_t mac[6], const uint8_t* buf, size_t len) {
+  if (!g_espnowUp) return;
+  espEnsurePeer(mac);
+  esp_now_send(mac, buf, len);
+}
+
+// CMD / CONFIG: queued, resent until the node ACKs the same seq (max 3 retries).
+static void espQueueReliable(int idx, PendingTx& p, uint8_t type, const void* payload, size_t plen) {
+  if (!g_espnowUp) return;
+  p.len    = espBuild(p.buf, type, payload, plen);
+  p.seq    = g_hubSeq;
+  p.tries  = 0;
+  p.active = true;
+  p.sentMs = millis();
+  espSendRaw(nodes[idx].mac, p.buf, p.len);
+}
+
+static void espRetryTick() {
+  uint32_t now = millis();
+  for (int i = 0; i < MAX_NODES; i++) {
+    PendingTx* list[2] = { &g_pendCmd[i], &g_pendCfg[i] };
+    for (PendingTx* p : list) {
+      if (!p->active || now - p->sentMs < TX_ACK_WAIT_MS) continue;
+      if (p->tries >= TX_MAX_RETRY) {
+        p->active = false;
+        nodes[i].txFails++;
+        Serial.printf("[ESPNOW] %s: no ACK for seq %u after %u retries\n",
+                      nodes[i].id.c_str(), p->seq, TX_MAX_RETRY);
+        continue;
+      }
+      p->tries++;
+      p->sentMs = now;
+      espSendRaw(nodes[i].mac, p->buf, p->len);
+    }
+  }
+}
+
+static void espSendConfig(int idx) {
+  bg_config_t c = {};
+  c.hbridge_open_ms  = nodes[idx].hbridge_open_ms;
+  c.hbridge_close_ms = nodes[idx].hbridge_close_ms;
+  c.endstops         = nodes[idx].endstops ? 1 : 0;
+  espQueueReliable(idx, g_pendCfg[idx], BG_CONFIG, &c, sizeof(c));
+}
+
+static void espSendCmd(int idx, uint8_t code) {
+  bg_cmd_t c = {};
+  c.cmd = code;
+  espQueueReliable(idx, g_pendCmd[idx], BG_CMD, &c, sizeof(c));
+}
+
+static void espSendHelloAck(int idx, bool withKey) {
+  bg_hello_ack_t a = {};
+  a.channel = currentChannel();
+  a.flags   = withKey ? BG_ACK_HAS_KEY : 0;
+  a.cfg.hbridge_open_ms  = nodes[idx].hbridge_open_ms;
+  a.cfg.hbridge_close_ms = nodes[idx].hbridge_close_ms;
+  a.cfg.endstops         = nodes[idx].endstops ? 1 : 0;
+  if (withKey) memcpy(a.key, g_netKey, BG_KEY_LEN);
+  uint8_t buf[BG_MAX_FRAME];
+  size_t n = espBuild(buf, BG_HELLO_ACK, &a, sizeof(a));
+  espSendRaw(nodes[idx].mac, buf, n);
+}
+
+static uint32_t g_lastHbMs = 0;
+static void espHeartbeatTick() {
+  if (!g_espnowUp || millis() - g_lastHbMs < 1000) return;
+  g_lastHbMs = millis();
+  bg_heartbeat_t hb = {};
+  hb.channel  = currentChannel();
+  hb.sys      = (manual_overdrive ? BG_SYS_MANUAL_OVERDRIVE : 0) |
+                (g_relayOn ? BG_SYS_RELAY_ON : 0) |
+                (pairingActive() ? BG_SYS_PAIRING : 0);
+  hb.uptime_s = millis() / 1000;
+  uint8_t buf[BG_MAX_FRAME];
+  size_t n = espBuild(buf, BG_HEARTBEAT, &hb, sizeof(hb));
+  esp_now_send(BCAST_MAC, buf, n);
+}
+
+static void espnowInit() {
+  esp_wifi_set_protocol(WIFI_IF_AP,
+    WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+  if (g_staEnabled)
+    esp_wifi_set_protocol(WIFI_IF_STA,
+      WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+  esp_wifi_set_max_tx_power(BG_TX_POWER);
+
+  esp_wifi_get_mac(WIFI_IF_AP, g_hubMac);
+  g_espRxQueue = xQueueCreate(12, sizeof(EspRxItem));
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESPNOW] init FAILED");
+    return;
+  }
+  esp_now_register_recv_cb(onEspNowRecv);
+  espEnsurePeer(BCAST_MAC);
+  g_hubSeq   = (uint16_t)esp_random();
+  g_espnowUp = true;
+  Serial.printf("[ESPNOW] up: mac=%s channel=%u tx_power=%d\n",
+                macToStr(g_hubMac).c_str(), currentChannel(), BG_TX_POWER);
+}
+
+// Keep ESP-NOW alive from inside long blocking HTTP handlers (uploads/downloads).
+static void espKeepAlive() {
+  esp_task_wdt_reset();
+  espHeartbeatTick();
 }
 
 // ---------------- SEND TO NODE ----------------
 static void sendCfgToNode(int idx) {
   if (idx < 0) return;
   if (!nodeOnlineIdx(idx)) return;
+  if (nodes[idx].transport == TRANSPORT_ESPNOW) {
+    espSendConfig(idx);
+    nodes[idx].lastCfgSentMs = millis();
+    return;
+  }
+#if BLAST_TRANSPORT_UDP
   if (nodes[idx].lastIp == IPAddress(0, 0, 0, 0)) return;
 
   String cmd = "CFG ";
@@ -615,8 +935,10 @@ static void sendCfgToNode(int idx) {
   udp.print(cmd);
   udp.endPacket();
   nodes[idx].lastCfgSentMs = millis();
+#endif
 }
 
+#if BLAST_TRANSPORT_UDP
 static void maybeSendCfgToNode(int idx) {
   if (idx < 0) return;
   uint32_t now = millis();
@@ -624,15 +946,27 @@ static void maybeSendCfgToNode(int idx) {
       (now - nodes[idx].lastCfgSentMs) < CFG_SEND_MIN_INTERVAL_MS) return;
   sendCfgToNode(idx);
 }
+#endif
 
 static void sendGateToNode(int idx, uint8_t gate) {
   if (idx < 0) return;
   if (!nodeOnlineIdx(idx)) return;
+  if (nodes[idx].transport == TRANSPORT_ESPNOW) {
+    espSendCmd(idx, gate == GATE_OPEN ? BG_CMD_OPEN : gate == GATE_CLOSE ? BG_CMD_CLOSE : BG_CMD_AUTO);
+    return;
+  }
+#if BLAST_TRANSPORT_UDP
   if (nodes[idx].lastIp == IPAddress(0, 0, 0, 0)) return;
   String cmd = String("GATE ") + gateName(gate);
   udp.beginPacket(nodes[idx].lastIp, nodes[idx].listenPort);
   udp.print(cmd);
   udp.endPacket();
+#endif
+}
+
+// Node has a way to receive commands (ESP-NOW MAC or legacy UDP IP)
+static bool nodeHasRoute(int i) {
+  return nodes[i].transport == TRANSPORT_ESPNOW || nodes[i].lastIp != IPAddress(0, 0, 0, 0);
 }
 
 // ---------------- HUB HEARTBEAT ----------------
@@ -757,7 +1091,7 @@ static void updateGateScheduler() {
   for (int i = 0; i < MAX_NODES; i++) {
     if (!nodes[i].id.length()) continue;
     if (!nodeOnlineIdx(i)) continue;
-    if (nodes[i].lastIp == IPAddress(0, 0, 0, 0)) continue;
+    if (!nodeHasRoute(i)) continue;
 
     bool wantOpen = nodeWantsOpenNow(i);
 
@@ -785,6 +1119,158 @@ static void updateGateScheduler() {
       }
     }
   }
+}
+
+// ---------------- ESP-NOW RX ----------------
+// Same behaviour as the UDP NODE_HELLO path: push config + current gate state.
+static void espNodeJoin(int idx, bool isNewNode) {
+  if (manual_overdrive) {
+    nodes[idx].mode = MODE_MANUAL;
+  } else if (isNewNode) {
+    nodes[idx].mode         = MODE_AUTO;
+    nodes[idx].gateOverride = GATE_AUTO;
+    nodes[idx].active       = false;
+    Serial.printf("[ESPNOW] NEW node %s - reset to AUTO mode\n", nodes[idx].id.c_str());
+  }
+  sendCfgToNode(idx);
+  if (nodeWantsOpenNow(idx)) {
+    sendGateToNode(idx, GATE_OPEN);
+    nodes[idx].lastGateCmd = GATE_OPEN;
+  } else {
+    sendGateToNode(idx, GATE_CLOSE);
+    nodes[idx].lastGateCmd = GATE_CLOSE;
+  }
+  broadcastHubUpdate();
+}
+
+static void espLogLimited(const char* msg, const uint8_t mac[6]) {
+  static uint32_t lastMs = 0;
+  if (millis() - lastMs < 2000) return;
+  lastMs = millis();
+  Serial.printf("[ESPNOW] %s from %s\n", msg, macToStr(mac).c_str());
+}
+
+static void espHandleFrame(const EspRxItem& it) {
+  const uint8_t* f = it.data;
+  if (it.len < (int)(sizeof(bg_hdr_t) + BG_TAG_LEN)) return;
+  const bg_hdr_t* h = bg_header(f);
+  if (h->magic != BG_MAGIC) return;
+  if (memcmp(h->mac, it.src, 6) != 0) return;               // spoofed header MAC
+  if (h->type != BG_HELLO && h->type != BG_DATA && h->type != BG_ACK) return;  // node types only
+
+  bool pairReq = false;
+  if (h->type == BG_HELLO && it.len == (int)(sizeof(bg_hdr_t) + sizeof(bg_hello_t) + BG_TAG_LEN)) {
+    bg_hello_t hello;
+    memcpy(&hello, bg_payload(f), sizeof(hello));
+    pairReq = (hello.flags & BG_HELLO_PAIR_REQ) != 0;
+  }
+
+  int plen;
+  if (pairReq) {
+    if (!pairingActive()) { espLogLimited("pair request outside pairing window", it.src); return; }
+    plen = bg_check(f, it.len, ZERO_KEY);
+    if (plen != (int)sizeof(bg_hello_t)) return;
+    if (!pairAdd(it.src)) { espLogLimited("pair list full", it.src); return; }
+  } else {
+    if (!pairIsKnown(it.src)) { espLogLimited("ignored unpaired node", it.src); return; }
+    plen = bg_check(f, it.len, g_netKey);
+    if (plen == -2) { Serial.printf("[ESPNOW] unknown proto_version %u from %s — ignored\n",
+                                    h->ver, macToStr(it.src).c_str()); return; }
+    if (plen < 0)   { espLogLimited("bad HMAC", it.src); return; }
+  }
+
+  String id = idFromMac(it.src);
+  bool isNewNode = (findNode(id) < 0);
+  int idx = allocNode(id);
+  if (idx < 0) { espLogLimited("no node slots", it.src); return; }
+
+  NodeState& n = nodes[idx];
+  const bool wasOnline = (n.transport == TRANSPORT_ESPNOW) && nodeOnlineIdx(idx);
+  const uint32_t now = millis();
+  n.lastSeen  = now;
+  n.rssi      = it.rssi;
+  n.transport = TRANSPORT_ESPNOW;
+  memcpy(n.mac, it.src, 6);
+
+  switch (h->type) {
+    case BG_HELLO: {
+      if (plen != (int)sizeof(bg_hello_t)) return;
+      bg_hello_t hello;
+      memcpy(&hello, bg_payload(f), sizeof(hello));
+      memcpy(n.fw, hello.fw, BG_FW_LEN);
+      n.fw[BG_FW_LEN - 1] = 0;
+      n.actuator       = hello.actuator;
+      n.lastRxSeqValid = false;   // node (re)started its sequence
+      n.btnCountValid  = false;
+      Serial.printf("[ESPNOW] HELLO %s fw=%s ch=%u rssi=%d%s\n", id.c_str(), n.fw,
+                    hello.channel, it.rssi, pairReq ? " (pairing)" : "");
+      espSendHelloAck(idx, pairReq);
+      espNodeJoin(idx, isNewNode);
+      break;
+    }
+
+    case BG_DATA: {
+      if (plen != (int)sizeof(bg_data_t)) return;
+      if (n.lastRxSeqValid && h->seq == n.lastRxSeq) return;   // duplicate
+      n.lastRxSeq = h->seq; n.lastRxSeqValid = true;
+      if (!wasOnline) espNodeJoin(idx, isNewNode);            // hub rebooted / node came back
+
+      bg_data_t d;
+      memcpy(&d, bg_payload(f), sizeof(d));
+      n.gateState   = d.gate;
+      n.err         = d.err;
+      n.endstopBits = d.endstops;
+      n.nodeUptime  = d.uptime_s;
+      n.nodeRssi    = d.rssi;
+      if (d.gate == BG_GATE_OPEN || d.gate == BG_GATE_CLOSED) {
+        n.gateConfirmed   = (d.gate == BG_GATE_OPEN) ? GATE_OPEN : GATE_CLOSE;
+        n.gateConfirmedMs = now;
+      }
+
+      // Node button: short press increments btn_count (same meaning as UDP BTN_TOGGLE)
+      if (n.btnCountValid && d.btn_count != n.btnCount) {
+        if (manual_overdrive) {
+          n.mode = MODE_MANUAL;
+          n.gateOverride = (n.gateOverride == GATE_OPEN) ? GATE_CLOSE : GATE_OPEN;
+          Serial.printf("[ESPNOW] %s button -> %s\n", id.c_str(), gateName(n.gateOverride));
+        } else {
+          Serial.printf("[ESPNOW] %s button ignored (manual overdrive off)\n", id.c_str());
+        }
+      }
+      n.btnCount = d.btn_count; n.btnCountValid = true;
+
+      n.lastValueRxMs = now;
+      float val = d.value;
+      n.lastValue = val;
+      if (manual_overdrive) {
+        // Auto-exit overdrive if sensor fires
+        if (val >= n.threshold_on) {
+          Serial.printf("[OVERDRIVE] Sensor %s triggered (%.2f >= %.2f) - AUTO EXIT\n",
+            id.c_str(), val, n.threshold_on);
+          applyManualOverdrive(false);
+          (void)applyThresholdLogicAndReturnChanged(idx, val);
+        }
+      } else {
+        (void)applyThresholdLogicAndReturnChanged(idx, val);
+      }
+      break;
+    }
+
+    case BG_ACK: {
+      if (plen != (int)sizeof(bg_ack_t)) return;
+      bg_ack_t a;
+      memcpy(&a, bg_payload(f), sizeof(a));
+      if (g_pendCmd[idx].active && g_pendCmd[idx].seq == a.acked_seq) g_pendCmd[idx].active = false;
+      if (g_pendCfg[idx].active && g_pendCfg[idx].seq == a.acked_seq) g_pendCfg[idx].active = false;
+      break;
+    }
+  }
+}
+
+static void espProcessRx() {
+  if (!g_espRxQueue) return;
+  EspRxItem it;
+  while (xQueueReceive(g_espRxQueue, &it, 0) == pdTRUE) espHandleFrame(it);
 }
 
 // ---------------- STATUS JSON (cached) ----------------
@@ -828,8 +1314,8 @@ static String jsonStatus_build() {
   }
 
   // Static buffer — no heap alloc on each call.
-  // ~200 bytes/node × MAX_NODES=16 + 256 header = ~3.5KB; 6KB gives safe headroom.
-  static char buf[6144];
+  // ~420 bytes/node × MAX_NODES=16 + 400 header = ~7.1KB; 8KB gives headroom.
+  static char buf[8192];
   int p = 0;
   uint32_t now = millis();
 
@@ -853,6 +1339,10 @@ static String jsonStatus_build() {
     "\"relayState\":%d,"
     "\"relayMode\":%d,"
     "\"prov\":%d,"
+    "\"espnow\":%d,"
+    "\"channel\":%u,"
+    "\"pairing\":%d,"
+    "\"pairedCount\":%d,"
     "\"nodes\":[",
     (unsigned long)(now / 1000),
     (unsigned)ESP.getFreeHeap(),
@@ -862,13 +1352,17 @@ static String jsonStatus_build() {
     ethIpStr,
     manual_overdrive ? 1 : 0,
     relayState, relayMode,
-    g_provActive ? 1 : 0);
+    g_provActive ? 1 : 0,
+    g_espnowUp ? 1 : 0,
+    (unsigned)currentChannel(),
+    pairingActive() ? 1 : 0,
+    g_pairCount);
 
   bool first = true;
   for (int i = 0; i < MAX_NODES; i++) {
     if (!nodes[i].id.length()) continue;
-    // Safety: leave room for closing "]}" and one more node header
-    if (p > (int)sizeof(buf) - 384) break;
+    // Safety: leave room for closing "]}" and one more node
+    if (p > (int)sizeof(buf) - 560) break;
 
     uint32_t age      = nodes[i].lastSeen ? (now - nodes[i].lastSeen) : 99999999;
     bool     online   = (age <= NODE_TIMEOUT_MS);
@@ -911,6 +1405,36 @@ static String jsonStatus_build() {
       (unsigned long)nodes[i].gate_hold_ms,
       (unsigned long)nodes[i].hbridge_open_ms,
       (unsigned long)nodes[i].hbridge_close_ms);
+
+    // v1.5.0 additions (apps ignore unknown fields)
+    char fwEsc[24];
+    escapeJsonTo(fwEsc, sizeof(fwEsc), nodes[i].fw);
+    const char* tr = nodes[i].transport == TRANSPORT_ESPNOW ? "espnow"
+                   : nodes[i].transport == TRANSPORT_UDP    ? "udp" : "none";
+    p += snprintf(buf + p, sizeof(buf) - p,
+      "\"transport\":\"%s\","
+      "\"mac\":\"%s\","
+      "\"paired\":%d,"
+      "\"rssi\":%d,"
+      "\"nodeRssi\":%d,"
+      "\"lastSeenMs\":%lu,"
+      "\"fw\":\"%s\","
+      "\"gateState\":%u,"
+      "\"err\":%u,"
+      "\"endstops\":%d,"
+      "\"endstopBits\":%u,"
+      "\"nodeUptime\":%lu,"
+      "\"txFails\":%lu,",
+      tr,
+      nodes[i].transport == TRANSPORT_ESPNOW ? macToStr(nodes[i].mac).c_str() : "",
+      (nodes[i].transport == TRANSPORT_ESPNOW && pairIsKnown(nodes[i].mac)) ? 1 : 0,
+      (int)nodes[i].rssi, (int)nodes[i].nodeRssi,
+      (unsigned long)age,
+      fwEsc,
+      (unsigned)nodes[i].gateState, (unsigned)nodes[i].err,
+      nodes[i].endstops ? 1 : 0, (unsigned)nodes[i].endstopBits,
+      (unsigned long)nodes[i].nodeUptime,
+      (unsigned long)nodes[i].txFails);
 
     if (isnan(nodes[i].lastValue)) {
       p += snprintf(buf + p, sizeof(buf) - p,
@@ -1163,6 +1687,24 @@ static void startStaWifi() {
   WiFi.begin(STA_SSID, STA_PASS);
 }
 
+static void staSetEnabled(bool on) {
+  if (g_bleMode || on == g_staEnabled) return;
+  g_staEnabled = on;
+  if (!on) {
+    WiFi.disconnect(false, false);
+    staHasIP = false;
+    ensureAP();   // WIFI_AP on the fixed channel
+    Serial.printf("[NET] STA off (ETH uplink) — ESP-NOW on fixed channel %u\n", g_espnowCh);
+  } else {
+    ensureAP();   // back to WIFI_AP_STA
+    if (g_espnowUp)
+      esp_wifi_set_protocol(WIFI_IF_STA,
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+    if (hasSavedCreds() || !isPlaceholderStaCreds()) startStaWifi();
+    Serial.println("[NET] STA on (ETH lost) — channel follows the router");
+  }
+}
+
 // ---------------- UDP HANDLER ----------------
 static void handleUdp() {
   int psize = udp.parsePacket();
@@ -1270,6 +1812,8 @@ static void handleUdp() {
     }
   }
 
+#if BLAST_TRANSPORT_UDP
+  // ---- Legacy UDP node transport (transition period) ----
   if (msg.startsWith("NODE_HELLO")) {
     String id = getArg(msg, "id");
     if (!id.length()) { udpReply(rip, rport, "ERR NODE_HELLO id=... port=..."); return; }
@@ -1280,6 +1824,7 @@ static void handleUdp() {
 
     nodes[idx].lastSeen = millis();
     nodes[idx].lastIp   = rip;
+    nodes[idx].transport = TRANSPORT_UDP;
 
     String p = getArg(msg, "port");
     if (p.length()) { uint16_t lp = (uint16_t)p.toInt(); if (lp > 0) nodes[idx].listenPort = lp; }
@@ -1336,6 +1881,7 @@ static void handleUdp() {
 
     nodes[idx].lastSeen = millis();
     nodes[idx].lastIp   = rip;
+    nodes[idx].transport = TRANSPORT_UDP;
 
     String p = getArg(msg, "port");
     if (p.length()) { uint16_t lp = (uint16_t)p.toInt(); if (lp > 0) nodes[idx].listenPort = lp; }
@@ -1348,6 +1894,7 @@ static void handleUdp() {
     udpReply(rip, rport, "OK");
     return;
   }
+#endif // BLAST_TRANSPORT_UDP
 
   if (msg.startsWith("ASSIGN")) {
     String id = getArg(msg, "id");
@@ -1441,12 +1988,14 @@ static void handleUdp() {
 
     String s_hbo = getArg(msg, "hbridge_open_ms");
     String s_hbc = getArg(msg, "hbridge_close_ms");
+    String s_end = getArg(msg, "endstops");   // optional (v1.5.0): 1 = Rev B end switches
 
     if (s_on.length())  nodes[idx].threshold_on    = s_on.toFloat();
     if (s_rh.length())  nodes[idx].relay_hold_ms   = (uint32_t)s_rh.toInt();
     if (s_gh.length())  nodes[idx].gate_hold_ms    = (uint32_t)s_gh.toInt();
     if (s_hbo.length()) nodes[idx].hbridge_open_ms  = (uint32_t)s_hbo.toInt();
     if (s_hbc.length()) nodes[idx].hbridge_close_ms = (uint32_t)s_hbc.toInt();
+    if (s_end.length()) nodes[idx].endstops         = s_end.toInt() != 0;
 
     Serial.printf("[CFG_SET] id=%s thr=%.3f rh=%u gh=%u hbo=%u hbc=%u\n",
       id.c_str(), nodes[idx].threshold_on,
@@ -1455,7 +2004,8 @@ static void handleUdp() {
 
     saveNodeConfigToNVS(id, nodes[idx].threshold_on, nodes[idx].relay_hold_ms,
                         nodes[idx].gate_hold_ms, nodes[idx].gateOverride,
-                        nodes[idx].hbridge_open_ms, nodes[idx].hbridge_close_ms);
+                        nodes[idx].hbridge_open_ms, nodes[idx].hbridge_close_ms,
+                        nodes[idx].endstops);
     sendCfgToNode(idx);
     broadcastHubUpdate();
     udpReply(rip, rport, "OK");
@@ -1497,13 +2047,17 @@ static void handleUdp() {
     Serial.printf("[NODECMD] %s: override %s→%s (active=%d)\n",
       id.c_str(), gateName(oldOverride), gate.c_str(), nodes[idx].active);
 
+    // Pass the h-bridge/end-switch fields too; the short form reset them to defaults in NVS.
     saveNodeConfigToNVS(id, nodes[idx].threshold_on, nodes[idx].relay_hold_ms,
-                        nodes[idx].gate_hold_ms, nodes[idx].gateOverride);
+                        nodes[idx].gate_hold_ms, nodes[idx].gateOverride,
+                        nodes[idx].hbridge_open_ms, nodes[idx].hbridge_close_ms,
+                        nodes[idx].endstops);
     broadcastHubUpdate();
     udpReply(rip, rport, "OK");
     return;
   }
 
+#if BLAST_TRANSPORT_UDP
   if (msg.startsWith("NODE_PING")) {
     String id = getArg(msg, "id");
     if (!id.length()) { udpReply(rip, rport, "ERR missing id"); return; }
@@ -1513,6 +2067,7 @@ static void handleUdp() {
 
     nodes[idx].lastSeen = millis();
     nodes[idx].lastIp   = rip;
+    nodes[idx].transport = TRANSPORT_UDP;
 
     String p = getArg(msg, "port");
     if (p.length()) { uint16_t lp = (uint16_t)p.toInt(); if (lp > 0) nodes[idx].listenPort = lp; }
@@ -1535,6 +2090,7 @@ static void handleUdp() {
     uint32_t now = millis();
     nodes[idx].lastSeen = now;
     nodes[idx].lastIp   = rip;
+    nodes[idx].transport = TRANSPORT_UDP;
 
     // Rate-limit per node (1 Hz)
     if (nodes[idx].lastValueRxMs != 0 &&
@@ -1572,9 +2128,11 @@ static void handleUdp() {
 
     nodes[idx].lastSeen = millis();
     nodes[idx].lastIp   = rip;
+    nodes[idx].transport = TRANSPORT_UDP;
     udpReply(rip, rport, "OK");
     return;
   }
+#endif // BLAST_TRANSPORT_UDP
 
   udpReply(rip, rport, "ERR unknown");
 }
@@ -1709,6 +2267,42 @@ static void httpCors(WebServer& s) {
   s.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
+// ---------------- NODE FIRMWARE STORE ----------------
+// SPIFFS is only 128 KB, so the node image is staged in the hub's inactive OTA
+// slot. The hub never boots from it (no esp_ota_set_boot_partition); the next
+// hub OTA simply overwrites it.
+static const esp_partition_t* g_nodeFwPart = nullptr;
+static uint32_t g_nodeFwSize  = 0;
+static uint8_t  g_nodeFwSha[32];
+static bool     g_nodeFwValid = false;
+
+static const char* NODE_FW_URL = "http://192.168.4.1/node_fw.bin";
+
+static bool httpTokenOk() { return httpServer.header("X-OTA-Token") == g_otaToken; }
+
+static int httpNodeIdx() {
+  String id = httpJsonGet(httpServer.arg("plain"), "id");
+  return id.length() ? findNode(id) : -1;
+}
+
+// Compact node admin page: pairing, end switches, channel, node OTA.
+static const char NODES_HTML[] PROGMEM = R"rawhtml(<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Blastgate nodovi</title>
+<style>body{font-family:sans-serif;background:#111;color:#ddd;margin:12px}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #333;padding:4px;font-size:13px;text-align:left}button,input{margin:2px;padding:6px}.b{margin:8px 0}</style></head><body>
+<h3>Blastgate nodovi</h3><div class="b">Kanal: <b id="ch"></b> | Upareno: <b id="pc"></b> | <span id="pr"></span></div>
+<div class="b"><button onclick="p('/pair_start',{})">Upari (60 s)</button> Fiksni kanal (ETH): <input id="fc" size="2"><button onclick="p('/espnow_channel',{ch:v('fc')})">Sačuvaj</button></div>
+<div class="b">OTA token: <input id="tk" type="password"> Firmware noda: <input id="fw" type="file"><button onclick="up()">Pošalji na hub</button> <span id="fs"></span></div>
+<table><thead><tr><th>ID</th><th>Ime</th><th>Veza</th><th>RSSI</th><th>FW</th><th>Gate</th><th>Greška</th><th>Prekidači</th><th></th></tr></thead><tbody id="t"></tbody></table>
+<script>
+var G=['zatv.','otv.','otvara','zatvara','?'];function v(i){return document.getElementById(i).value}
+function h(){return{'Content-Type':'application/json','X-OTA-Token':v('tk')}}
+function p(u,b){return fetch(u,{method:'POST',headers:h(),body:JSON.stringify(b)}).then(r=>r.text()).then(t=>{document.getElementById('fs').textContent=t;ld()})}
+function up(){var f=document.getElementById('fw').files[0];if(!f)return;var d=new FormData();d.append('f',f);document.getElementById('fs').textContent='šaljem...';
+fetch('/node_fw',{method:'POST',headers:{'X-OTA-Token':v('tk')},body:d}).then(r=>r.text()).then(t=>document.getElementById('fs').textContent=t)}
+function ld(){fetch('/status').then(r=>r.json()).then(s=>{ch.textContent=s.channel;pc.textContent=s.pairedCount;pr.textContent=s.pairing?'UPARIVANJE AKTIVNO':'';
+var o='';s.nodes.forEach(n=>{var e=n.endstops?1:0;o+='<tr><td>'+n.id+'</td><td>'+n.name+'</td><td>'+(n.online?n.transport:'offline')+'</td><td>'+n.rssi+'</td><td>'+(n.fw||'')+'</td><td>'+(G[n.gateState]||'')+'</td><td>'+n.err+'</td><td><input type="checkbox" '+(e?'checked':'')+' onchange="p(\'/node_endstops\',{id:\''+n.id+'\',on:\''+(e?0:1)+'\'})"></td><td>'+(n.transport=='espnow'?'<button onclick="p(\'/node_ota\',{id:\''+n.id+'\'})">OTA</button><button onclick="p(\'/unpair\',{id:\''+n.id+'\'})">Ukloni</button>':'')+'</td></tr>'});t.innerHTML=o})}
+ld();setInterval(ld,2000)
+</script></body></html>)rawhtml";
+
 static void setupHttpServer() {
 
   // CORS preflight for browser-based provisioning pages
@@ -1790,6 +2384,7 @@ static void setupHttpServer() {
         }
         Serial.printf("[OTA] start: %s\n", up.filename.c_str());
         esp_task_wdt_reset();
+        g_nodeFwValid = false;   // hub OTA overwrites the slot that holds the node image
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
           Update.printError(Serial);
         }
@@ -1929,6 +2524,142 @@ static void setupHttpServer() {
   });
 #endif
 
+  // ---------------- ESP-NOW node admin ----------------
+  httpServer.on("/nodes", HTTP_GET, []() {
+    httpServer.send_P(200, "text/html; charset=utf-8", NODES_HTML);
+  });
+
+  // POST /pair_start — open the 60s pairing window (same as holding MANUAL 3s)
+  httpServer.on("/pair_start", HTTP_POST, []() {
+    httpCors(httpServer);
+    startPairing();
+    httpServer.send(200, "application/json", "{\"ok\":true,\"seconds\":60}");
+  });
+
+  // POST /unpair {"id":"BG-XXXXXX"} — remove node from the paired list
+  httpServer.on("/unpair", HTTP_POST, []() {
+    int idx = httpNodeIdx();
+    if (idx < 0 || nodes[idx].transport != TRANSPORT_ESPNOW || !pairRemove(nodes[idx].mac)) {
+      httpServer.send(404, "application/json", "{\"ok\":false,\"error\":\"not paired\"}");
+      return;
+    }
+    Serial.printf("[PAIR] removed %s\n", nodes[idx].id.c_str());
+    invalidateStatusCache();
+    httpServer.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // POST /node_endstops {"id":"...","on":"1"} — Rev B end switches fitted
+  httpServer.on("/node_endstops", HTTP_POST, []() {
+    int idx = httpNodeIdx();
+    if (idx < 0) { httpServer.send(404, "application/json", "{\"ok\":false,\"error\":\"unknown id\"}"); return; }
+    nodes[idx].endstops = httpJsonGet(httpServer.arg("plain"), "on") == "1";
+    saveNodeConfigToNVS(nodes[idx].id, nodes[idx].threshold_on, nodes[idx].relay_hold_ms,
+                        nodes[idx].gate_hold_ms, nodes[idx].gateOverride,
+                        nodes[idx].hbridge_open_ms, nodes[idx].hbridge_close_ms,
+                        nodes[idx].endstops);
+    sendCfgToNode(idx);
+    invalidateStatusCache();
+    httpServer.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // POST /espnow_channel {"ch":"6"} — fixed channel used while ETH is the uplink
+  httpServer.on("/espnow_channel", HTTP_POST, []() {
+    int ch = httpJsonGet(httpServer.arg("plain"), "ch").toInt();
+    if (ch < 1 || ch > 13) { httpServer.send(400, "application/json", "{\"ok\":false,\"error\":\"ch 1..13\"}"); return; }
+    prefs.begin("blastgate", false);
+    prefs.putUChar("esn_ch", (uint8_t)ch);
+    prefs.end();
+    g_espnowCh = (uint8_t)ch;
+    if (!g_staEnabled) ensureAP();   // apply now when STA is off
+    httpServer.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // POST /node_fw — multipart upload of node firmware.bin (X-OTA-Token)
+  httpServer.on("/node_fw", HTTP_POST,
+    []() {
+      if (!httpTokenOk()) { httpServer.send(401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}"); return; }
+      if (!g_nodeFwValid) { httpServer.send(500, "application/json", "{\"ok\":false,\"error\":\"store_failed\"}"); return; }
+      char sha[65];
+      for (int i = 0; i < 32; i++) sprintf(sha + i * 2, "%02x", g_nodeFwSha[i]);
+      String body = String("{\"ok\":true,\"size\":") + g_nodeFwSize + ",\"sha256\":\"" + sha + "\"}";
+      httpServer.send(200, "application/json", body);
+    },
+    []() {
+      static bool     ok;
+      static uint32_t written, erased;
+      static mbedtls_sha256_context sha;
+      HTTPUpload& up = httpServer.upload();
+      if (up.status == UPLOAD_FILE_START) {
+        g_nodeFwValid = false;
+        ok = httpTokenOk();
+        g_nodeFwPart = esp_ota_get_next_update_partition(NULL);
+        if (!g_nodeFwPart) ok = false;
+        written = erased = 0;
+        mbedtls_sha256_init(&sha);
+        mbedtls_sha256_starts(&sha, 0);
+        Serial.printf("[NODE_FW] upload start ok=%d\n", (int)ok);
+      } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (!ok) return;
+        if (written + up.currentSize > g_nodeFwPart->size) { ok = false; return; }
+        while (erased < written + up.currentSize) {       // erase sector by sector
+          if (esp_partition_erase_range(g_nodeFwPart, erased, 4096) != ESP_OK) { ok = false; return; }
+          erased += 4096;
+        }
+        if (esp_partition_write(g_nodeFwPart, written, up.buf, up.currentSize) != ESP_OK) { ok = false; return; }
+        mbedtls_sha256_update(&sha, up.buf, up.currentSize);
+        written += up.currentSize;
+        espKeepAlive();
+      } else if (up.status == UPLOAD_FILE_END) {
+        mbedtls_sha256_finish(&sha, g_nodeFwSha);
+        mbedtls_sha256_free(&sha);
+        uint8_t magic = 0;
+        if (ok && written) esp_partition_read(g_nodeFwPart, 0, &magic, 1);
+        g_nodeFwSize  = written;
+        g_nodeFwValid = ok && written > 0 && magic == 0xE9;   // ESP image magic
+        Serial.printf("[NODE_FW] stored %u bytes valid=%d\n", written, (int)g_nodeFwValid);
+      } else if (up.status == UPLOAD_FILE_ABORTED) {
+        mbedtls_sha256_free(&sha);
+        g_nodeFwValid = false;
+      }
+    });
+
+  // GET /node_fw.bin — nodes pull the staged image from here during OTA
+  httpServer.on("/node_fw.bin", HTTP_GET, []() {
+    if (!g_nodeFwValid) { httpServer.send(404, "text/plain", "no node firmware"); return; }
+    httpServer.setContentLength(g_nodeFwSize);
+    httpServer.send(200, "application/octet-stream", "");
+    WiFiClient c = httpServer.client();
+    static uint8_t buf[2048];
+    uint32_t off = 0;
+    while (off < g_nodeFwSize && c.connected()) {
+      uint32_t n = min((uint32_t)sizeof(buf), g_nodeFwSize - off);
+      esp_partition_read(g_nodeFwPart, off, buf, n);
+      if (c.write(buf, n) != n) break;
+      off += n;
+      espKeepAlive();
+    }
+    Serial.printf("[NODE_FW] served %u/%u bytes\n", off, g_nodeFwSize);
+  });
+
+  // POST /node_ota {"id":"..."} — tell an ESP-NOW node to pull /node_fw.bin (X-OTA-Token)
+  httpServer.on("/node_ota", HTTP_POST, []() {
+    if (!httpTokenOk()) { httpServer.send(401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}"); return; }
+    if (!g_nodeFwValid) { httpServer.send(409, "application/json", "{\"ok\":false,\"error\":\"upload node firmware first\"}"); return; }
+    int idx = httpNodeIdx();
+    if (idx < 0 || nodes[idx].transport != TRANSPORT_ESPNOW || !nodeOnlineIdx(idx)) {
+      httpServer.send(404, "application/json", "{\"ok\":false,\"error\":\"node not online on ESP-NOW\"}");
+      return;
+    }
+    bg_cmd_t c = {};
+    c.cmd     = BG_CMD_OTA_START;
+    c.fw_size = g_nodeFwSize;
+    memcpy(c.sha256, g_nodeFwSha, 32);
+    strncpy(c.url, NODE_FW_URL, sizeof(c.url) - 1);
+    espQueueReliable(idx, g_pendCmd[idx], BG_CMD, &c, sizeof(c));
+    Serial.printf("[NODE_FW] OTA_START -> %s\n", nodes[idx].id.c_str());
+    httpServer.send(200, "application/json", "{\"ok\":true}");
+  });
+
   // Captive-portal root: minimal provisioning page served on AP IP
   httpServer.onNotFound([]() {
     // Redirect all unknown requests to /wifi_scan page (captive portal)
@@ -2063,6 +2794,9 @@ void setup() {
     prefs.putString("ota_tok", g_otaToken);
     Serial.println("[OTA] No token in NVS — seeded default. CHANGE IT via /ota_token_set!");
   }
+  // Fixed ESP-NOW / Soft AP channel used while ETH is the uplink
+  g_espnowCh = prefs.getUChar("esn_ch", 1);
+  if (g_espnowCh < 1 || g_espnowCh > 13) g_espnowCh = 1;
 #if BLAST_BLE_PROV
   // Load BLE provisioning PoP (proof-of-possession) from NVS
   g_provPop = prefs.getString("prov_pop", "");
@@ -2124,10 +2858,22 @@ void setup() {
   startEthFixed();
 
 #if BLAST_BLE_PROV
-  if (g_skipStaInit) {
-    // Booted into BLE prov mode — erase any leftover creds, start BLE.
-    // WiFi STA is intentionally NOT started so it can't race with BLE.
+  // Auto-start BLE provisioning when there are no saved WiFi creds.
+  // This is the ESP-IDF standard pattern: a hub with no creds is, by
+  // definition, awaiting pairing. The user can also force this state by
+  // factory-resetting (5s hold of MANUAL button) or POSTing /wifi_prov
+  // (which clears creds + reboots). After pairing the manager saves creds
+  // and an ESP.restart() in PROV_END returns the hub to normal STA mode.
+  const bool wantBleProv = g_skipStaInit || (!hasSavedCreds() && isPlaceholderStaCreds());
+  g_bleMode = wantBleProv;
+  if (wantBleProv) {
+    // Force AP-only mode so the ESP32 WiFi driver can't silently reconnect
+    // STA from its RAM cache while BLE is starting.
+    WiFi.mode(WIFI_AP);
+    delay(50);
+    WiFi.mode(WIFI_AP_STA);  // BT and SoftAP can coexist; STA stays idle (no begin)
     staForgetCreds();
+    Serial.println("[PROV] no creds saved — auto-starting BLE provisioning");
     startBleProvisioning();
   } else
 #endif
@@ -2142,6 +2888,15 @@ void setup() {
   Serial.printf("[UDP] listening on %u\n", UDP_PORT);
 
   ensureAP();
+
+  // ESP-NOW node link. Not started in BLE-only mode (after /wifi_prov);
+  // the next normal boot brings it back.
+  pairLoad();
+#if BLAST_BLE_PROV
+  if (g_skipStaInit) Serial.println("[ESPNOW] skipped (BLE-only provisioning boot)");
+  else
+#endif
+  espnowInit();
 
   // mDNS: hub reachable as blastgate.local on any interface
   if (MDNS.begin("blastgate")) {
@@ -2176,6 +2931,9 @@ void loop() {
 
   ledUpdate();
   handleUdp();
+  espProcessRx();
+  espRetryTick();
+  espHeartbeatTick();
   httpServer.handleClient();
   ethFallbackCheck();
   net_tick();
@@ -2186,21 +2944,33 @@ void loop() {
     broadcastHubReady();
   }
 
-  // Manual overdrive button debounce (toggle on press)
+  // MANUAL button (debounced)
+  // Short press (<3s, fires on release): toggle manual overdrive
+  // Long press (>=3s): open the ESP-NOW pairing window (60s)
   {
-    static bool     last_btn      = true;
+    static bool     last_btn      = false;
     static uint32_t btn_debounce  = 0;
     static bool     btn_was_down  = false;
+    static uint32_t btn_down_ms   = 0;
+    static bool     btn_long      = false;
 
     bool btn_now = (digitalRead(MANUAL_BTN_PIN) == LOW);
     if (btn_now != last_btn) { last_btn = btn_now; btn_debounce = millis(); }
     if ((millis() - btn_debounce) > 50) {
       if (btn_now && !btn_was_down) {
         btn_was_down = true;
-        applyManualOverdrive(!manual_overdrive);
-        Serial.printf("[BTN] Manual overdrive: %s\n", manual_overdrive ? "ON" : "OFF");
-      } else if (!btn_now) {
+        btn_down_ms  = millis();
+        btn_long     = false;
+      } else if (btn_now && !btn_long && millis() - btn_down_ms >= 3000) {
+        btn_long = true;
+        startPairing();
+        Serial.println("[BTN] MANUAL long press -> pairing");
+      } else if (!btn_now && btn_was_down) {
         btn_was_down = false;
+        if (!btn_long) {
+          applyManualOverdrive(!manual_overdrive);
+          Serial.printf("[BTN] Manual overdrive: %s\n", manual_overdrive ? "ON" : "OFF");
+        }
       }
     }
   }
