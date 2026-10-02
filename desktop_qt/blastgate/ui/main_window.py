@@ -14,6 +14,7 @@ from .events_page import EventsPage
 from .node_dialog import NodeDialog
 from .overview_page import OverviewPage
 from .theme import c, palette, qss, set_current
+from .updater import AppUpdater
 from .widgets import label
 
 logger = logging.getLogger(__name__)
@@ -58,11 +59,14 @@ class MainWindow(QMainWindow):
         brand.addStretch(1)
         sl.addLayout(brand)
 
+        self.updater = AppUpdater(ctl)
         self.stack = QStackedWidget()
-        self.overview = OverviewPage(ctl)
+        self.overview = OverviewPage(ctl, self.updater)
         self.overview.open_node.connect(self.open_node)
         self.overview.node_action.connect(self._node_action)
-        self.pages: List[QWidget] = [self.overview, self._lazy_system(), EventsPage(ctl), self._lazy_settings()]
+        self.overview.open_hub_update.connect(self._open_hub_update)
+        self.system = self._lazy_system()
+        self.pages: List[QWidget] = [self.overview, self.system, EventsPage(ctl), self._lazy_settings()]
         for p in self.pages:
             self.stack.addWidget(p)
 
@@ -96,6 +100,7 @@ class MainWindow(QMainWindow):
         self.show_page(0)
 
         ctl.start()
+        self.updater.start()
         if not ctl.demo_hub:
             QTimer.singleShot(1000, self._auto_discover_on_start)
             QTimer.singleShot(5000, self._check_firewall_once)
@@ -103,7 +108,7 @@ class MainWindow(QMainWindow):
     # the Sistem / Podešavanja pages import lazily to keep startup simple
     def _lazy_system(self) -> QWidget:
         from .system_page import SystemPage
-        return SystemPage(self.ctl)
+        return SystemPage(self.ctl, self.updater)
 
     def _lazy_settings(self) -> QWidget:
         from .settings_page import SettingsPage
@@ -115,6 +120,10 @@ class MainWindow(QMainWindow):
         self.brand_icon.setPixmap(icons.pixmap("layout-grid", c("accent"), 26))
         for i, b in enumerate(self.nav_buttons):
             b.setIcon(icons.icon(NAV[i][1], c("accent") if b.isChecked() else c("muted"), 24))
+
+    def _open_hub_update(self) -> None:
+        self.show_page(1)
+        self.system.show_updates()
 
     def show_page(self, idx: int) -> None:
         self.stack.setCurrentIndex(idx)

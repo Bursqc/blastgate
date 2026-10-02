@@ -1,13 +1,17 @@
 """Stage a release: collect the files, hash them, write the update manifest.
 
 The apps read releases/manifest.json from the main branch; it points at the
-assets of a GitHub release. Nothing here talks to GitHub — the script prints
+assets of GitHub releases. Nothing here talks to GitHub — the script prints
 the commands, so publishing stays a separate, deliberate step.
 
-  python tools/make_release.py --tag v1.5.1 \
-      --firmware firmware/hub-wt32/.pio/build/wt32_s1_eth01/firmware.bin --fw-version 1.5.1 \
-      --apk-dir <folder with app-<abi>-release.apk> --app-version 2.4.0 \
-      --fw-notes "..." --app-notes "..." --out <staging folder> [--write-manifest]
+A release may carry any of the three parts; the parts that are left out keep
+pointing at the release they came from:
+
+  python tools/make_release.py --tag v1.5.1 --out <staging folder> \
+      --firmware firmware/hub-wt32/.pio/build/wt32_s1_eth01/firmware.bin --fw-version 1.5.1 --fw-notes "..." \
+      --apk-dir <folder with app-<abi>-release.apk> --app-version 2.4.0 --app-notes "..." \
+      --desktop-setup desktop_qt/dist/installer/Blastgate-2.2.0-Setup.exe --desktop-version 2.2.0 \
+      --desktop-notes "..." [--write-manifest]
 
 APKs must be the per-ABI ones (flutter build apk --release --split-per-abi),
 all built on the same machine: Android only installs an update signed with the
@@ -23,6 +27,7 @@ import shutil
 REPO = "Bursqc/blastgate"
 ABIS = ["arm64-v8a", "armeabi-v7a", "x86_64"]
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MANIFEST = os.path.join(HERE, "releases", "manifest.json")
 
 
 def asset(path, name, tag, out):
@@ -35,39 +40,55 @@ def asset(path, name, tag, out):
     }
 
 
+def notes(text):
+    return text.replace("\\n", "\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
-    ap.add_argument("--firmware", required=True)
-    ap.add_argument("--fw-version", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--firmware")
+    ap.add_argument("--fw-version")
     ap.add_argument("--fw-notes", default="")
     ap.add_argument("--min-prev", default="1.2.0", help="oldest hub firmware that may update to this one")
-    ap.add_argument("--apk-dir", required=True)
-    ap.add_argument("--app-version", required=True)
+    ap.add_argument("--apk-dir")
+    ap.add_argument("--app-version")
     ap.add_argument("--app-notes", default="")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--desktop-setup")
+    ap.add_argument("--desktop-version")
+    ap.add_argument("--desktop-notes", default="")
     ap.add_argument("--write-manifest", action="store_true", help="also overwrite releases/manifest.json")
     a = ap.parse_args()
+    for path, version, what in ((a.firmware, a.fw_version, "firmware"), (a.apk_dir, a.app_version, "app"),
+                                (a.desktop_setup, a.desktop_version, "desktop")):
+        if bool(path) != bool(version):
+            ap.error(f"{what}: give both the file and its version")
+    if not (a.firmware or a.apk_dir or a.desktop_setup):
+        ap.error("nothing to release")
 
     os.makedirs(a.out, exist_ok=True)
-    fw = asset(a.firmware, "firmware.bin", a.tag, a.out)
-    apks = {}
-    for abi in ABIS:
-        src = os.path.join(a.apk_dir, f"app-{abi}-release.apk")
-        apks[abi] = asset(src, f"blastgate-mobile-{a.app_version}-{abi}.apk", a.tag, a.out)
+    with open(MANIFEST, encoding="utf-8") as f:
+        manifest = json.load(f)                      # parts not released now stay as they are
 
-    manifest = {
-        "version": a.fw_version,
-        **fw,
-        "minPrevVersion": a.min_prev,
-        "changelog": a.fw_notes.replace("\\n", "\n"),
-        "app": {"version": a.app_version, "changelog": a.app_notes.replace("\\n", "\n"), "apks": apks},
-    }
+    if a.firmware:
+        manifest.update({"version": a.fw_version, **asset(a.firmware, "firmware.bin", a.tag, a.out),
+                         "minPrevVersion": a.min_prev, "changelog": notes(a.fw_notes)})
+    if a.apk_dir:
+        manifest["app"] = {"version": a.app_version, "changelog": notes(a.app_notes), "apks": {
+            abi: asset(os.path.join(a.apk_dir, f"app-{abi}-release.apk"),
+                       f"blastgate-mobile-{a.app_version}-{abi}.apk", a.tag, a.out)
+            for abi in ABIS}}
+    if a.desktop_setup:
+        manifest["desktop"] = {"version": a.desktop_version,
+                               **asset(a.desktop_setup, f"Blastgate-{a.desktop_version}-Setup.exe", a.tag, a.out),
+                               "changelog": notes(a.desktop_notes)}
+
     text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
     with open(os.path.join(a.out, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
     if a.write_manifest:
-        with open(os.path.join(HERE, "releases", "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+        with open(MANIFEST, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
 
     files = " ".join(f'"{os.path.join(a.out, n)}"' for n in sorted(os.listdir(a.out)) if n != "manifest.json")

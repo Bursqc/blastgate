@@ -135,3 +135,8 @@ mobile/apk/*.apk
 desktop_qt/logs/
 desktop_qt/blastgate_gui_config.json
 .tmp.driveupload/
+
+# Desktop (Qt) packaging output
+desktop_qt/build/
+desktop_qt/dist/
+desktop_qt/blastgate/_build_version.py

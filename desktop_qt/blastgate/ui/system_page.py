@@ -1,4 +1,4 @@
-"""Sistem — hub state, node table, WiFi of the hub, hub firmware (OTA)."""
+"""Sistem — hub state, node table, WiFi of the hub, updates (app + hub firmware)."""
 import json
 import time
 import webbrowser
@@ -13,12 +13,13 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFileDia
                                QProgressBar, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
                                QWidget)
 
-from ..constants import LOG_PATH
+from ..constants import APP_VERSION, LOG_PATH
 from ..network.ota import check_and_get_update, download_firmware, is_newer, upload_to_hub, wait_for_reboot
 from . import icons
 from . import state as S
 from .controller import Controller
 from .theme import c
+from .updater import AppUpdater
 from .widgets import Banner, Card, StatusLabel, button, divider, label
 
 
@@ -51,9 +52,10 @@ def _info_card(title: str, icon_name: str) -> tuple:
 class SystemPage(QWidget):
     COLS = ["Mašina", "ID", "Veza", "Status", "Režim", "Zatvarač", "Signal", "Poslednja poruka"]
 
-    def __init__(self, ctl: Controller) -> None:
+    def __init__(self, ctl: Controller, updater: AppUpdater) -> None:
         super().__init__()
         self.ctl = ctl
+        self.updater = updater
         root = QVBoxLayout(self)
         root.setContentsMargins(32, 26, 32, 22)
         root.setSpacing(14)
@@ -62,7 +64,7 @@ class SystemPage(QWidget):
         titles = QVBoxLayout()
         titles.setSpacing(2)
         titles.addWidget(label("Sistem", "PageTitle"))
-        titles.addWidget(label("Stanje huba, mašina, WiFi i firmware.", "PageSubtitle"))
+        titles.addWidget(label("Stanje huba i mašina, WiFi huba i ažuriranja.", "PageSubtitle"))
         head.addLayout(titles)
         head.addStretch(1)
         self.overall = StatusLabel(size=16)
@@ -71,11 +73,13 @@ class SystemPage(QWidget):
         head.addWidget(button("Osveži status", "refresh", "outline", on_click=self._refresh))
         root.addLayout(head)
 
-        tabs = QTabWidget()
+        self.tabs = tabs = QTabWidget()
         tabs.addTab(self._build_state_tab(), "Stanje")
         tabs.addTab(self._build_wifi_tab(), "WiFi huba")
-        tabs.addTab(self._build_fw_tab(), "Firmware huba")
+        tabs.addTab(self._build_fw_tab(), "Ažuriranja")
         root.addWidget(tabs, 1)
+        updater.changed.connect(self._app_update_refresh)
+        self._app_update_refresh()
 
         ctl.status_changed.connect(self._on_status)
         self._on_status(ctl.status, ctl.state)
@@ -363,12 +367,79 @@ class SystemPage(QWidget):
                         lambda _r: self.wifi_msg.show_msg("WiFi zaboravljen, hub se restartuje.", "info"),
                         lambda e: self.wifi_msg.show_msg(f"Greška: {e}", "danger", "alert-circle"))
 
-    # ============================================================= Firmware
+    # =========================================================== Ažuriranja
+    def show_updates(self) -> None:
+        """Open the updates tab and look for new hub firmware (from the strip on Pregled)."""
+        self.tabs.setCurrentIndex(2)
+        self._fw_check()
+
+    def _build_app_card(self) -> Card:
+        card = Card()
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(20, 14, 20, 16)
+        cl.setSpacing(10)
+        head = QHBoxLayout()
+        head.addWidget(label("Aplikacija na ovom računaru", "SectionTitle"))
+        head.addStretch(1)
+        self.app_state = StatusLabel()
+        head.addWidget(self.app_state)
+        cl.addLayout(head)
+        g = QGridLayout()
+        g.addWidget(label("Instalirana verzija", "Muted"), 0, 0)
+        g.addWidget(label(APP_VERSION, "MidValue"), 0, 1)
+        g.addWidget(label("Najnovija verzija", "Muted"), 1, 0)
+        self.app_latest = label("—", "MidValue")
+        g.addWidget(self.app_latest, 1, 1)
+        g.setColumnStretch(2, 1)
+        cl.addLayout(g)
+        self.app_msg = label("", "Muted", wrap=True)
+        cl.addWidget(self.app_msg)
+        row = QHBoxLayout()
+        self.btn_app_check = button("Proveri sada", "refresh", "outline", on_click=self.updater.check)
+        row.addWidget(self.btn_app_check)
+        self.btn_app_install = button("Instaliraj i pokreni ponovo", "download", "primary",
+                                      on_click=self.updater.install)
+        row.addWidget(self.btn_app_install)
+        row.addStretch(1)
+        cl.addLayout(row)
+        return card
+
+    def _app_update_refresh(self) -> None:
+        up = self.updater
+        self.app_latest.setText(up.release.version if up.release else "—")
+        self.btn_app_check.setEnabled(not up.checking)
+        self.btn_app_install.setVisible(bool(up.setup))
+        if up.app_update:
+            self.app_state.set("IMA NOVA VERZIJA", "info")
+        elif up.release:
+            self.app_state.set("AŽURNO", "success")
+        else:
+            self.app_state.set("NIJE PROVERENO", "idle")
+
+        if up.checking:
+            msg = "Proveravam…"
+        elif up.failed:
+            msg = "Provera nije uspela. Računar nema pristup internetu."
+        elif up.app_update and not up.self_update:
+            msg = "Ova kopija je pokrenuta iz izvornog koda i ne ažurira se sama."
+        elif up.setup:
+            msg = "Nova verzija je preuzeta. Instalacija zatvara aplikaciju i sama je ponovo pokreće."
+        elif up.downloading:
+            msg = f"Preuzimam novu verziju… {up.progress} %"
+        elif up.app_update:
+            msg = "Preuzimanje nije uspelo. Dodirni „Proveri sada\" da probaš ponovo."
+        elif up.checked_at:
+            msg = f"Poslednja provera: {up.checked_at:%H:%M:%S}. Aplikacija proverava sama pri pokretanju."
+        else:
+            msg = "Još nije provereno."
+        self.app_msg.setText(msg)
+
     def _build_fw_tab(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 14, 0, 0)
         lay.setSpacing(14)
+        lay.addWidget(self._build_app_card())
         card = Card()
         cl = QVBoxLayout(card)
         cl.setContentsMargins(20, 14, 20, 16)

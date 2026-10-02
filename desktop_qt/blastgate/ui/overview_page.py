@@ -9,6 +9,8 @@ from . import icons
 from . import state as S
 from .controller import Controller
 from .theme import c
+from .update_bar import UpdateStrip, app_strip_state, hub_strip_state
+from .updater import AppUpdater
 from .widgets import (Badge, Banner, Card, Dot, IconValue, Segmented, StatusLabel, TileGrid, ValueBar,
                       button, divider, label)
 
@@ -203,10 +205,12 @@ class SummaryBar(Card):
 class OverviewPage(QWidget):
     open_node = Signal(str)
     node_action = Signal(str, str)   # action, node_id
+    open_hub_update = Signal()       # „Ažuriraj hub" on the firmware strip
 
-    def __init__(self, ctl: Controller) -> None:
+    def __init__(self, ctl: Controller, updater: AppUpdater) -> None:
         super().__init__()
         self.ctl = ctl
+        self.updater = updater
         self.tiles: Dict[str, NodeTile] = {}
 
         root = QVBoxLayout(self)
@@ -238,6 +242,12 @@ class OverviewPage(QWidget):
             head.addWidget(lb)
         root.addLayout(head)
 
+        self.app_strip = UpdateStrip(self._app_update_action, lambda: self._hide_strip("app_hidden"))
+        self.hub_strip = UpdateStrip(self.open_hub_update.emit, lambda: self._hide_strip("hub_hidden"))
+        root.addWidget(self.app_strip)
+        root.addWidget(self.hub_strip)
+        updater.changed.connect(self._update_strips)
+
         self.banner = Banner()
         root.addWidget(self.banner)
 
@@ -260,6 +270,24 @@ class OverviewPage(QWidget):
 
         ctl.status_changed.connect(self.update_status)
         self.update_status({}, "SEARCHING")
+
+    def _update_strips(self) -> None:
+        for strip, (visible, text, action) in ((self.app_strip, app_strip_state(self.updater)),
+                                               (self.hub_strip, hub_strip_state(self.updater))):
+            if visible:
+                strip.show_state(text, action)
+            else:
+                strip.hide()
+
+    def _app_update_action(self) -> None:
+        if self.updater.setup:
+            self.updater.install()
+        else:
+            self.updater.check()      # download failed earlier: try again
+
+    def _hide_strip(self, flag: str) -> None:
+        setattr(self.updater, flag, True)
+        self._update_strips()
 
     def update_status(self, st: Dict[str, Any], state: str) -> None:
         nodes = st.get("nodes", []) or []

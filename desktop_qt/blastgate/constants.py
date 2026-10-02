@@ -6,19 +6,30 @@ import os
 from pathlib import Path
 
 # Application version
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
+try:  # build_setup.py --version writes this file for test builds of another version
+    from ._build_version import VERSION as APP_VERSION  # noqa: F811
+except ImportError:
+    pass
 
 # Application directory — next to the exe when frozen, else gui/ folder
 if getattr(sys, 'frozen', False):
     APP_DIR = Path(sys.executable).parent.absolute()
+    # Installed app: settings and logs live in the user profile, so an update
+    # (which replaces the program folder) never touches them
+    DATA_DIR = Path(os.environ.get("APPDATA") or APP_DIR) / "Blastgate"
 else:
     APP_DIR = Path(__file__).parent.parent.absolute()
+    DATA_DIR = APP_DIR
 
 # Config file path
-CFG_PATH = APP_DIR / "blastgate_gui_config.json"
+CFG_PATH = DATA_DIR / "blastgate_gui_config.json"
 
 # Log file path
-LOG_PATH = APP_DIR / "logs" / "blastgate.log"
+LOG_PATH = DATA_DIR / "logs" / "blastgate.log"
+
+# Downloaded installers of new versions
+UPDATE_DIR = DATA_DIR / "updates"
 
 # AP detection interval (seconds) - only re-check AP ping this often
 AP_DETECT_INTERVAL_S = 60.0
