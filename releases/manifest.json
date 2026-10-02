@@ -1,8 +1,29 @@
 {
-  "version": "1.4.3",
-  "url": "https://github.com/Bursqc/blastgate/releases/download/v1.4.3/firmware.bin",
-  "size": 1936432,
-  "sha256": "099fe99fab80e708393e7fdf1ddab8ec4133373f9f40c1d09e4d6fa9256ddd2d",
-  "minPrevVersion": "1.0.0",
-  "changelog": "v1.4.3 — BLE prov via reboot (avoids WiFi/BT race)\n- /wifi_prov now sets ble_prov_pending=true in NVS and restarts the hub\n- On boot, ble_prov_pending flag triggers BLE-only mode (no WiFi STA init)\n- Eliminates the race where net_tick reconnects to STA while BLE is trying to start\n- After successful BLE pairing, new WiFi creds are saved by the network_provisioning manager"
+  "version": "1.5.1",
+  "url": "https://github.com/Bursqc/blastgate/releases/download/v1.5.1/firmware.bin",
+  "size": 1955824,
+  "sha256": "dcfc38424d4869b76a5f3f1d3d1782fa62f1f90c45990c849efae5ad1d77888a",
+  "minPrevVersion": "1.2.0",
+  "changelog": "- WiFi mreža huba (BLASTGATE_HUB) se ponovo vidi na telefonu i računaru\n- Dodavanje huba preko Bluetooth-a iz aplikacije\n- Stabilnija WiFi veza kad mrežni kabl nije priključen",
+  "app": {
+    "version": "2.4.0",
+    "changelog": "- Ažuriranja stižu sama\n- Dodaj mašinu u tri koraka, ukloni mašinu\n- WiFi huba: jedan vođeni tok\n- Događaji ostaju sačuvani\n- Nova ikona",
+    "apks": {
+      "arm64-v8a": {
+        "url": "https://github.com/Bursqc/blastgate/releases/download/v1.5.1/blastgate-mobile-2.4.0-arm64-v8a.apk",
+        "size": 26232563,
+        "sha256": "8fbf954f197bf352b4c16622b59e487e8618b7b68fb7240db1c75ed782cee15b"
+      },
+      "armeabi-v7a": {
+        "url": "https://github.com/Bursqc/blastgate/releases/download/v1.5.1/blastgate-mobile-2.4.0-armeabi-v7a.apk",
+        "size": 22036831,
+        "sha256": "eab6e38c782bdb4115f51cd4dbabf970a891a03a52a3ef2817e0b3d634cc1aa2"
+      },
+      "x86_64": {
+        "url": "https://github.com/Bursqc/blastgate/releases/download/v1.5.1/blastgate-mobile-2.4.0-x86_64.apk",
+        "size": 28706541,
+        "sha256": "bf4530b7eace7ace0231923954357928d005d65a00fcf553d34652827cd1dfbd"
+      }
+    }
+  }
 }
