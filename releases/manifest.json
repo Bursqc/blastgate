@@ -25,5 +25,12 @@
         "sha256": "bf4530b7eace7ace0231923954357928d005d65a00fcf553d34652827cd1dfbd"
       }
     }
+  },
+  "desktop": {
+    "version": "2.2.0",
+    "url": "https://github.com/Bursqc/blastgate/releases/download/desktop-v2.2.0/Blastgate-2.2.0-Setup.exe",
+    "size": 40333709,
+    "sha256": "5da513bb27fbe6d479eec54ee9d389847708111c7b13da95237e01bdcab5562e",
+    "changelog": "- Instaler za Windows\n- Aplikacija se sama ažurira\n- Sistem → Ažuriranja: aplikacija i firmware huba"
   }
 }
