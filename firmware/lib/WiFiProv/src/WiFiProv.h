@@ -29,7 +29,7 @@
 //Select the scheme using which you want to provision
 typedef enum {
   NETWORK_PROV_SCHEME_SOFTAP,
-#if (defined(CONFIG_BLUEDROID_ENABLED) || defined(CONFIG_NIMBLE_ENABLED)) && __has_include("esp_bt.h")
+#if (defined(CONFIG_BLUEDROID_ENABLED) || defined(CONFIG_NIMBLE_ENABLED) || defined(CONFIG_BT_NIMBLE_ENABLED)) && __has_include("esp_bt.h")
   NETWORK_PROV_SCHEME_BLE,
 #endif
   NETWORK_PROV_SCHEME_MAX
@@ -37,7 +37,7 @@ typedef enum {
 
 typedef enum {
   NETWORK_PROV_SCHEME_HANDLER_NONE,
-#if (defined(CONFIG_BLUEDROID_ENABLED) || defined(CONFIG_NIMBLE_ENABLED)) && __has_include("esp_bt.h")
+#if (defined(CONFIG_BLUEDROID_ENABLED) || defined(CONFIG_NIMBLE_ENABLED) || defined(CONFIG_BT_NIMBLE_ENABLED)) && __has_include("esp_bt.h")
   NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
   NETWORK_PROV_SCHEME_HANDLER_FREE_BLE,
   NETWORK_PROV_SCHEME_HANDLER_FREE_BT,

@@ -51,6 +51,15 @@ static inline void invalidateStatusCache();
 
 #if BLAST_BLE_PROV
 #include <WiFiProv.h>
+#include <esp32-hal-bt.h>
+#include <esp_event.h>
+#include <esp_coexist.h>
+#include <protocomm_ble.h>
+// The Arduino core frees the BLE controller memory at startup unless something
+// reports BLE in use. Stock WiFiProv got that from SimpleBLE.h (Bluedroid-only,
+// dropped for NimBLE) — without this the controller init fails ("BLE_INIT:
+// controller init failed") and provisioning never starts.
+bool bleInUse(void) { return true; }
 #endif
 
 // ---------------- FIRMWARE VERSION ----------------
@@ -63,7 +72,7 @@ static inline void invalidateStatusCache();
 static String g_otaToken;  // loaded from NVS at boot
 
 // ---------------- BLE PROVISIONING (compile-gated) ----------------
-// Provisioning is user-triggered (UDP "WIFI_PROV" or POST /wifi_prov), not auto.
+// Provisioning runs when there are no WiFi creds, or on request (UDP "WIFI_PROV" / POST /wifi_prov).
 // Espressif's manager runs BLE while active, auto-applies received creds, then
 // frees BT memory via NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM.
 #define PROV_DEFAULT_POP "blastgate"
@@ -71,6 +80,22 @@ static String g_otaToken;  // loaded from NVS at boot
 static String   g_provPop;
 static volatile bool g_provActive = false;
 static volatile bool g_skipStaInit = false;  // set when booting into BLE prov
+static volatile bool g_provEnded = false;    // PROV_END seen -> save creds + restart (loop)
+static volatile bool g_provCredRecv = false; // phone sent creds -> do not time the window out
+static volatile bool g_bleClient = false;      // a phone is connected over BLE right now
+static volatile uint32_t g_bleActivityMs = 0;  // last BLE connect/disconnect (window restarts here)
+// BLE window: with Bluedroid there is no heap for BLE + ESP-NOW, so a hub
+// without WiFi creds offers BLE for BLE_WINDOW_MS after power-up (nodes off),
+// then restarts into normal mode (nodes on, no BLE). The skip flag lives in
+// RTC memory: it survives that software restart, not a power cycle.
+static const uint32_t BLE_WINDOW_MS  = 180000;
+static const uint32_t BLE_SKIP_MAGIC = 0xB1E5C1D0;
+RTC_NOINIT_ATTR static uint32_t g_bleSkipMagic;
+#if defined(CONFIG_BT_NIMBLE_ENABLED)
+#define BLE_WITH_ESPNOW 1   // NimBLE: enough heap for BLE + ESP-NOW + ETH + AP
+#else
+#define BLE_WITH_ESPNOW 0
+#endif
 #else
 // Stub: prov is never active in builds without BLE. Keeps STATUS JSON valid.
 static const bool g_provActive = false;
@@ -396,6 +421,8 @@ static const uint32_t KNET_ETH_DEBOUNCE_MS  = 3000;
 static const uint32_t KNET_WIFI_DEBOUNCE_MS = 3000;
 static const uint32_t KNET_WIFI_TIMEOUT_MS  = 15000;
 static const uint32_t KNET_WIFI_MAX_RETRY   = 3;
+static const uint32_t KNET_STA_RETRY_MS     = 120000;  // AP_ONLY: retry the saved network
+static bool g_hasCreds = false;   // WiFi creds present at boot (set/forget both restart)
 
 static const char* netStateName(NetState s) {
   switch (s) {
@@ -543,7 +570,10 @@ static IPAddress calcBcast(IPAddress ip, IPAddress mask) {
   return b;
 }
 
+static bool    g_bleOnly    = false; // Bluedroid BLE window: BLE alone, no AP/ETH/HTTP/ESP-NOW
+
 static void sendBroadcast(const IPAddress& bcast, const String& m) {
+  if (g_bleOnly) return;   // BLE window: no IP interface to send on
   udp.beginPacket(bcast, UDP_PORT);
   udp.print(m);
   udp.endPacket();
@@ -557,6 +587,7 @@ static uint8_t g_espnowCh   = 1;     // fixed channel (NVS "esn_ch") when STA is
 static bool    g_bleMode    = false; // BLE provisioning owns STA — don't toggle it
 
 static void ensureAP() {
+  if (g_bleOnly) return;   // BLE window: no AP (heap)
   const wifi_mode_t mode = g_staEnabled ? WIFI_AP_STA : WIFI_AP;
   WiFi.setSleep(false);
   WiFi.mode(mode);
@@ -616,7 +647,9 @@ static void staDisconnectKeepCreds() {
 }
 
 static void staForgetCreds() {
-  WiFi.disconnect(false, false);
+  // eraseap=true: also clears the STA config the driver loaded at init,
+  // otherwise the provisioning manager still sees the hub as provisioned
+  WiFi.disconnect(false, true);
   delay(100);
 
   // Erase WiFi credentials from ESP32 NVS namespaces
@@ -884,11 +917,10 @@ static void espHeartbeatTick() {
 }
 
 static void espnowInit() {
-  esp_wifi_set_protocol(WIFI_IF_AP,
-    WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
-  if (g_staEnabled)
-    esp_wifi_set_protocol(WIFI_IF_STA,
-      WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+  // No WIFI_PROTOCOL_LR anywhere. Bench 02.10.2026: with LR enabled on the AP
+  // interface BLASTGATE_HUB is invisible to phones/PCs (toggled at runtime: off
+  // -> -42 dBm, on -> gone), and LR on the STA is not needed either. ESP-NOW
+  // runs at its default 1 Mbps rate (no espnow rate config), so LR bought nothing.
   esp_wifi_set_max_tx_power(BG_TX_POWER);
 
   esp_wifi_get_mac(WIFI_IF_AP, g_hubMac);
@@ -1507,11 +1539,24 @@ static String makeProvServiceName() {
   return String(name);
 }
 
+// Phone connected / disconnected over BLE (protocomm transport events)
+static void bleLinkEvent(void*, esp_event_base_t, int32_t id, void*) {
+  g_bleClient     = (id == PROTOCOMM_TRANSPORT_BLE_CONNECTED);
+  g_bleActivityMs = millis();
+  Serial.printf("[PROV] phone %s\n", g_bleClient ? "connected" : "disconnected");
+}
+
 static void startBleProvisioning() {
   if (g_provActive) {
     Serial.println("[PROV] already active — ignoring");
     return;
   }
+  esp_event_handler_register(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID, bleLinkEvent, nullptr);
+  // The provisioning manager drives the STA connect; Arduino's own reconnect only fights it
+  WiFi.setAutoReconnect(false);
+  // BLE link and WiFi share the radio: with the default balance the hub's WiFi
+  // scan came back empty or missed the strongest AP while a phone was connected
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 
   // We store WiFi creds in TWO namespaces:
   //   * "blastgate" (our own — wifi_ssid/wifi_pass)
@@ -1539,13 +1584,11 @@ static void startBleProvisioning() {
     nullptr,  // uuid (auto)
     false     // creds were just erased above, no need for double-clear
   );
-  // Print QR to serial — handy when testing with esp-prov / phone app
-  WiFiProv.printQR(svc.c_str(), g_provPop.c_str(), "ble");
 }
 #endif // BLAST_BLE_PROV
 
 // ---------------- WIFI EVENT ----------------
-void WiFiEvent(WiFiEvent_t event) {
+void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
 #if BLAST_BLE_PROV
     case ARDUINO_EVENT_PROV_INIT:
@@ -1557,16 +1600,25 @@ void WiFiEvent(WiFiEvent_t event) {
       invalidateStatusCache();
       break;
     case ARDUINO_EVENT_PROV_CRED_RECV:
+      g_provCredRecv = true;
+      // BLE link and STA connect share the radio; give WiFi the air time while joining
+      esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
       Serial.println("[PROV] credentials received");
       break;
     case ARDUINO_EVENT_PROV_CRED_FAIL:
       Serial.println("[PROV] credentials FAILED (bad password?)");
+      // Without this the manager stays in the failed state and rejects the next attempt
+      esp_wifi_disconnect();   // stop the retry so the manager can take new creds
+      network_prov_mgr_reset_wifi_sm_state_on_failure();
+      esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+      g_provCredRecv = false;
       break;
     case ARDUINO_EVENT_PROV_CRED_SUCCESS:
       Serial.println("[PROV] credentials SUCCESS — connected to WiFi");
       break;
     case ARDUINO_EVENT_PROV_END:
       g_provActive = false;
+      g_provEnded = true;
       Serial.println("[PROV] END (BT memory released)");
       invalidateStatusCache();
       break;
@@ -1609,7 +1661,7 @@ void WiFiEvent(WiFiEvent_t event) {
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       staHasIP = false;
-      Serial.println("[STA] DISCONNECTED");
+      Serial.printf("[STA] DISCONNECTED reason=%d\n", (int)info.wifi_sta_disconnected.reason);
       break;
     default:
       break;
@@ -1622,6 +1674,10 @@ static const IPAddress ETH_FALLBACK_GW(169, 254, 5, 1);
 static const IPAddress ETH_FALLBACK_MASK(255, 255, 0, 0);
 static bool ethFallbackActive = false;
 
+static const uint32_t ETH_PROBE_MS = 8000;
+static bool     g_ethOn   = false;   // PHY powered
+static uint32_t g_ethOnMs = 0;       // powered / last link-up time
+
 static void startEthFixed() {
   Serial.println("[ETH] begin (PWR=16, CLK=GPIO0_IN) ...");
   bool ok = false;
@@ -1631,7 +1687,39 @@ static void startEthFixed() {
   ok = ETH.begin(ETH_ADDR, ETH_POWER_PIN, ETH_MDC_PIN, ETH_MDIO_PIN, ETH_TYPE, ETH_CLK_MODE);
 #endif
   if (!ok) { Serial.println("[ETH] begin() FAILED"); return; }
+  g_ethOn   = true;
+  g_ethOnMs = millis();
   Serial.println("[ETH] begin OK, waiting link/DHCP...");
+}
+
+// The PHY's 50 MHz RMII clock (GPIO0, gated by the PHY power pin) radiates on
+// this board; its 49th harmonic (2450 MHz) blinds the STA on WiFi channels
+// 7-10 (bench: reason=2 forever with the PHY on, instant connect with it off).
+// So the PHY only stays powered while it is useful:
+//   cable linked                     -> on (the STA is off in that mode anyway)
+//   STA joining / joined, no cable   -> off after ETH_PROBE_MS
+//   AP only (no creds, or the saved  -> on, a cable can be plugged in any time
+//     network gave up for now)
+// Limit: a cable plugged in while WiFi is up is only seen after a restart.
+static void ethPowerTick() {
+  static uint32_t lastTick = 0;
+  const uint32_t now = millis();
+  if (g_bleOnly || now - lastTick < 500) return;
+  lastTick = now;
+
+  const bool staWanted = g_hasCreds && g_net != NET_AP_ONLY;
+  if (g_ethOn) {
+    if (ETH.linkUp()) { g_ethOnMs = now; return; }
+    if (!staWanted || now - g_ethOnMs < ETH_PROBE_MS) return;
+    Serial.println("[ETH] no cable — PHY off (its clock jams WiFi ch 7-10)");
+    ETH.end();
+    pinMode(ETH_POWER_PIN, OUTPUT);
+    digitalWrite(ETH_POWER_PIN, LOW);
+    g_ethOn = false;
+  } else if (!staWanted) {
+    Serial.println("[ETH] AP only — PHY on to look for a cable");
+    startEthFixed();
+  }
 }
 
 // If ETH link is up but DHCP hasn't assigned IP after 8s, assign link-local fallback
@@ -1697,9 +1785,6 @@ static void staSetEnabled(bool on) {
     Serial.printf("[NET] STA off (ETH uplink) — ESP-NOW on fixed channel %u\n", g_espnowCh);
   } else {
     ensureAP();   // back to WIFI_AP_STA
-    if (g_espnowUp)
-      esp_wifi_set_protocol(WIFI_IF_STA,
-        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
     if (hasSavedCreds() || !isPlaceholderStaCreds()) startStaWifi();
     Serial.println("[NET] STA on (ETH lost) — channel follows the router");
   }
@@ -1760,7 +1845,7 @@ static void handleUdp() {
     // Schedule a reboot into BLE prov mode (avoids race between WiFi STA
     // reconnect and BLE start when both share the radio).
     prefs.begin("blastgate", false);
-    prefs.putBool("ble_prov_pending", true);
+    prefs.putBool("ble_pend", true);
     prefs.end();
     udpReply(rip, rport, "OK WIFI_PROV pending — restarting into BLE mode");
     restartSoon(400);
@@ -2200,7 +2285,13 @@ static void net_tick() {
           WiFi.reconnect();
           g_netEnterMs = now;
         } else {
+          // Give up for now and stop the STA: while it keeps scanning for a
+          // network that is not there, the radio hops channels and the hub's
+          // own AP is hardly visible. AP_ONLY retries later.
           g_wifiRetries = 0;
+          WiFi.setAutoReconnect(false);
+          WiFi.disconnect(false, false);
+          Serial.println("[NET] saved WiFi not reachable — AP only, retry in 2 min");
           netEnter(NET_AP_ONLY);
         }
       }
@@ -2228,6 +2319,16 @@ static void net_tick() {
       if (ethUp && !ethOk){ netEnter(NET_ETH_WAIT);    break; }
       // No WiFi creds — hub operates in AP-only mode.
       // Use WIFI_SET UDP command or physical button to configure.
+      // Saved network that was out of reach: one more try every KNET_STA_RETRY_MS,
+      // but never while somebody is using the hub's AP (the scan disturbs it).
+      if (g_hasCreds && inState >= KNET_STA_RETRY_MS) {
+        if (WiFi.softAPgetStationNum() > 0) { g_netEnterMs = now; break; }
+        Serial.println("[NET] retrying saved WiFi");
+        g_wifiRetries = KNET_WIFI_MAX_RETRY - 1;   // a single attempt
+        WiFi.setAutoReconnect(true);
+        startStaWifi();
+        netEnter(NET_WIFI_WAIT);
+      }
       break;
   }
 }
@@ -2484,7 +2585,7 @@ static void setupHttpServer() {
   httpServer.on("/wifi_prov", HTTP_POST, []() {
     httpCors(httpServer);
     prefs.begin("blastgate", false);
-    prefs.putBool("ble_prov_pending", true);
+    prefs.putBool("ble_pend", true);
     prefs.end();
     String svc = makeProvServiceName();
     String body = "{\"ok\":true,\"reboot\":true,\"service\":\"" + svc +
@@ -2767,12 +2868,16 @@ void setup() {
   // Watchdog (30s)
   Serial.println("[WDT] Initializing watchdog (30s)");
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  // Core 3.x already initializes the TWDT before setup(); init() would fail
+  // ("TWDT already initialized") and leave the default timeout — reconfigure it.
+  // Subscribe first: reconfigure() resets the calling task's timer ("task not found" otherwise).
+  esp_task_wdt_add(NULL);
   const esp_task_wdt_config_t wdt_config = { .timeout_ms = 30000, .idle_core_mask = 0, .trigger_panic = true };
-  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_reconfigure(&wdt_config);
 #else
   esp_task_wdt_init(30, true);
-#endif
   esp_task_wdt_add(NULL);
+#endif
 
   pinMode(STATUS_LED_PIN, OUTPUT);
   hub_ready = false;
@@ -2807,8 +2912,8 @@ void setup() {
   }
   // Check if a previous run scheduled us to boot into BLE prov mode
   // (UDP WIFI_PROV / HTTP /wifi_prov sets this flag then restarts).
-  if (prefs.getBool("ble_prov_pending", false)) {
-    prefs.remove("ble_prov_pending");
+  if (prefs.getBool("ble_pend", false)) {
+    prefs.remove("ble_pend");
     g_skipStaInit = true;
     Serial.println("[PROV] booting into BLE prov mode (skipping STA init)");
   }
@@ -2848,32 +2953,45 @@ void setup() {
   }
 
   WiFi.setSleep(false);
-  WiFi.mode(WIFI_AP_STA);
   WiFi.onEvent(WiFiEvent);
-
-  WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  ensureAP();
-
-  startEthFixed();
+  WiFi.mode(WIFI_STA);   // driver up, STA idle (no begin) — needed before the creds check
+  g_hasCreds = hasSavedCreds() || !isPlaceholderStaCreds();
 
 #if BLAST_BLE_PROV
-  // Auto-start BLE provisioning when there are no saved WiFi creds.
-  // This is the ESP-IDF standard pattern: a hub with no creds is, by
-  // definition, awaiting pairing. The user can also force this state by
-  // factory-resetting (5s hold of MANUAL button) or POSTing /wifi_prov
-  // (which clears creds + reboots). After pairing the manager saves creds
-  // and an ESP.restart() in PROV_END returns the hub to normal STA mode.
-  const bool wantBleProv = g_skipStaInit || (!hasSavedCreds() && isPlaceholderStaCreds());
+  // BLE provisioning runs whenever the hub has no WiFi creds (first boot,
+  // factory reset, forget) or on request (/wifi_prov, UDP WIFI_PROV ->
+  // ble_prov_pending). When provisioning ends the loop saves the creds and
+  // restarts into normal STA mode (provEndTick).
+  // The previous boot timed the BLE window out (software restart) -> normal mode this time
+  const bool bleWindowDone = (esp_reset_reason() == ESP_RST_SW && g_bleSkipMagic == BLE_SKIP_MAGIC);
+  g_bleSkipMagic = 0;
+  if (bleWindowDone) Serial.println("[PROV] BLE window expired last boot — normal mode (power-cycle to reopen)");
+  const bool wantBleProv = g_skipStaInit || (!bleWindowDone && !hasSavedCreds() && isPlaceholderStaCreds());
   g_bleMode = wantBleProv;
+  // Bluedroid + AP + ETH + HTTP leaves ~10 KB of heap (restart loop), so the
+  // BLE window runs BLE alone; NimBLE has room for everything.
+  g_bleOnly = wantBleProv && !BLE_WITH_ESPNOW;
+#endif
+
+  if (!g_bleOnly) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    ensureAP();
+    startEthFixed();
+  }
+
+#if BLAST_BLE_PROV
   if (wantBleProv) {
-    // Force AP-only mode so the ESP32 WiFi driver can't silently reconnect
-    // STA from its RAM cache while BLE is starting.
-    WiFi.mode(WIFI_AP);
-    delay(50);
-    WiFi.mode(WIFI_AP_STA);  // BT and SoftAP can coexist; STA stays idle (no begin)
-    staForgetCreds();
-    Serial.println("[PROV] no creds saved — auto-starting BLE provisioning");
+    if (!g_bleOnly) {
+      // Force AP-only mode so the ESP32 WiFi driver can't silently reconnect
+      // STA from its RAM cache while BLE is starting.
+      WiFi.mode(WIFI_AP);
+      delay(50);
+      WiFi.mode(WIFI_AP_STA);  // BT and SoftAP can coexist; STA stays idle (no begin)
+    }
+    Serial.printf("[PROV] no WiFi creds / requested — starting BLE provisioning%s\n",
+                  g_bleOnly ? " (BLE only for 3 min: no AP/ETH/nodes)" : "");
     startBleProvisioning();
   } else
 #endif
@@ -2889,24 +3007,27 @@ void setup() {
 
   ensureAP();
 
-  // ESP-NOW node link. Not started in BLE-only mode (after /wifi_prov);
-  // the next normal boot brings it back.
+  // ESP-NOW node link. With Bluedroid there is not enough heap for BLE +
+  // ESP-NOW together (abort at boot), so it is skipped while BLE runs;
+  // NimBLE (env wt32_nimble) leaves room for both.
   pairLoad();
-#if BLAST_BLE_PROV
-  if (g_skipStaInit) Serial.println("[ESPNOW] skipped (BLE-only provisioning boot)");
+#if BLAST_BLE_PROV && !BLE_WITH_ESPNOW
+  if (g_bleMode) Serial.println("[ESPNOW] skipped (Bluedroid BLE provisioning active)");
   else
 #endif
   espnowInit();
 
-  // mDNS: hub reachable as blastgate.local on any interface
-  if (MDNS.begin("blastgate")) {
-    MDNS.addService("http", "tcp", 80);
-    Serial.println("[mDNS] blastgate.local started");
-  } else {
-    Serial.println("[mDNS] FAILED");
-  }
+  if (!g_bleOnly) {
+    // mDNS: hub reachable as blastgate.local on any interface
+    if (MDNS.begin("blastgate")) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.println("[mDNS] blastgate.local started");
+    } else {
+      Serial.println("[mDNS] FAILED");
+    }
 
-  setupHttpServer();
+    setupHttpServer();
+  }
 
   applyManualOverdrive(manual_overdrive);
   broadcastHello();
@@ -2926,16 +3047,83 @@ void setup() {
 // ===============================
 // LOOP
 // ===============================
+#if BLAST_BLE_PROV
+// After BLE provisioning: copy the creds the manager stored (nvs.net80211)
+// into our own namespace and restart, so the hub boots in normal STA mode
+// with BLE off and the usual ETH > WiFi > AP priority.
+static void provEndTick() {
+#if !BLE_WITH_ESPNOW
+  // BLE window over and nobody is provisioning: restart into normal mode so the nodes run
+  // (never while a phone is connected; the window restarts from the last BLE activity)
+  if (g_bleMode && !g_provCredRecv && !g_provEnded && !g_bleClient &&
+      millis() - g_bleActivityMs > BLE_WINDOW_MS) {
+    Serial.println("[PROV] BLE window expired — restarting into normal mode");
+    g_bleSkipMagic = BLE_SKIP_MAGIC;
+    restartSoon(500);
+  }
+#endif
+  if (!g_provEnded) return;
+  g_provEnded = false;
+  String ssid = WiFi.SSID();
+  if (ssid.length()) {
+    prefs.begin("blastgate", false);
+    prefs.putString("wifi_ssid", ssid);
+    prefs.putString("wifi_pass", WiFi.psk());
+    prefs.end();
+    Serial.printf("[PROV] saved creds for '%s'\n", ssid.c_str());
+  }
+  restartSoon(1000);
+}
+#endif
+
+// Serial console for bench testing (one command per line):
+//   forget = erase WiFi creds + restart   prov = restart into BLE provisioning
+//   reboot = restart                       heap = free heap + mode
+static void serialTick() {
+  static char    buf[16];
+  static uint8_t n = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c != '\n' && c != '\r') {
+      if (n < sizeof(buf) - 1) buf[n++] = c;
+      continue;
+    }
+    buf[n] = 0;
+    n = 0;
+    if (!strcmp(buf, "forget")) {
+      Serial.println("[CMD] forget WiFi creds + restart");
+      staForgetCreds();
+      restartSoon(300);
+    } else if (!strcmp(buf, "prov")) {
+      Serial.println("[CMD] restart into BLE provisioning");
+      prefs.begin("blastgate", false);
+      prefs.putBool("ble_pend", true);
+      prefs.end();
+      restartSoon(300);
+    } else if (!strcmp(buf, "reboot")) {
+      restartSoon(300);
+    } else if (!strcmp(buf, "heap")) {
+      Serial.printf("[CMD] heap=%u ble=%d sta=%d ip=%s\n", (unsigned)ESP.getFreeHeap(),
+                    (int)g_bleMode, (int)staHasIP, WiFi.localIP().toString().c_str());
+    }
+  }
+}
+
 void loop() {
   esp_task_wdt_reset();
+  serialTick();
+#if BLAST_BLE_PROV
+  provEndTick();
+#endif
 
   ledUpdate();
   handleUdp();
   espProcessRx();
   espRetryTick();
   espHeartbeatTick();
-  httpServer.handleClient();
+  if (!g_bleOnly) httpServer.handleClient();
   ethFallbackCheck();
+  ethPowerTick();
   net_tick();
 
   // HUB_READY heartbeat (1s)
@@ -3056,7 +3244,7 @@ void loop() {
   // AP watchdog (2s)
   {
     static uint32_t lastApCheck = 0;
-    if (millis() - lastApCheck > 2000) {
+    if (!g_bleOnly && millis() - lastApCheck > 2000) {
       lastApCheck = millis();
       wifi_mode_t m = WiFi.getMode();
       if ((m != WIFI_AP && m != WIFI_AP_STA) || WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) {
