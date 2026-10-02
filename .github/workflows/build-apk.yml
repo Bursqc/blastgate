@@ -1,12 +1,14 @@
 name: Build Android APK
 
-# Builds and publishes a release APK whenever:
-#  - a v* tag is pushed (attached to the GitHub Release of that tag), OR
-#  - the workflow is dispatched manually from the Actions tab
+# Test build only, started by hand from the Actions tab (APKs are kept as
+# workflow artifacts).
+#
+# It no longer runs on v* tags: every CI runner signs with its own throwaway
+# debug key, so a CI-built APK cannot be installed over the released one and
+# the in-app update would fail with "App not installed". Release APKs are
+# built on the release machine (one stable key) and staged with
+# tools/make_release.py.
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
 
 permissions:

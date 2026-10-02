@@ -123,3 +123,15 @@ firmware/**/*.bin
 firmware/**/*.elf
 firmware/**/*.map
 firmware/**/*.hex
+
+# PlatformIO hybrid-compile leftovers (generated, 170+ MB)
+firmware/hub-wt32/managed_components/
+firmware/hub-wt32/.dummy/
+firmware/hub-wt32/sdkconfig.defaults
+
+# Release APKs live in GitHub releases, not in git
+mobile/apk/*.apk
+
+desktop_qt/logs/
+desktop_qt/blastgate_gui_config.json
+.tmp.driveupload/
