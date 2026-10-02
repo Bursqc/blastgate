@@ -132,16 +132,13 @@ static uint8_t  consecutiveSpikeCount = 0;
 static uint32_t bootMs = 0;
 constexpr uint32_t BOOT_HOLD_MS = 2500;
 
-// ================= KALIBRACIJA OPSEG =================
-// Posle warmup-a, EMA mora da bude u opsegu [CALIB_MIN..CALIB_MAX]
-// za CALIB_NEED_OK uzastopnih citanja. Ako nije -> restart.
-// LED blinka dok kalibracija nije OK.
-constexpr float   CALIB_MIN     = 0.0f;
-constexpr float   CALIB_MAX     = 30.0f;   // normalna vrednost u mirovanju max 30
-constexpr uint8_t CALIB_NEED_OK = 8;       // 8 uzastopnih OK citanja = kalibrisano
-
+// ================= KALIBRACIJA =================
+// Senzor je spreman cim prodju warmup i boot hold i postoji prvo ocitavanje.
+// Offset je prosek warmup uzoraka, pa je tacan i kad masina radi pri paljenju.
+// (Ranije: EMA je morala biti < 30, inace restart — nod se nije dizao dok
+// masina radi ili dok je sum u mirovanju iznad 30.)
+// LED blinka dok senzor nije spreman.
 static bool    calibrated   = false;
-static uint8_t calibOkCount = 0;
 
 // Calibration LED state
 static uint32_t calibLedT     = 0;
@@ -289,7 +286,6 @@ static void resetFilters() {
   emaInit      = false;
   ema          = 0.0f;
   calibrated   = false;
-  calibOkCount = 0;
 }
 
 // LED priority: pairing (fast) > unpaired (slow) > calibration (150ms) > off
@@ -972,20 +968,10 @@ void loop() {
     }
   }
 
-  // Calibration range check
+  // First valid reading after warm-up: start reporting real values
   if (sensorReady && !inBootHold() && emaInit && !calibrated) {
-    if (ema >= CALIB_MIN && ema <= CALIB_MAX) {
-      calibOkCount++;
-      if (calibOkCount >= CALIB_NEED_OK) {
-        calibrated = true;
-        Serial.printf("[CALIB] OK: ema=%.2f in [%.1f..%.1f] (%u samples)\n",
-                      ema, CALIB_MIN, CALIB_MAX, calibOkCount);
-      }
-    } else {
-      Serial.printf("[CALIB] van opsega (ema=%.2f > %.1f) -> restart!\n", ema, CALIB_MAX);
-      delay(300);
-      ESP.restart();
-    }
+    calibrated = true;
+    Serial.printf("[CALIB] OK: ema=%.2f\n", ema);
   }
 
   float vSend = sensorReady ? ema : 0.0f;
@@ -1039,9 +1025,9 @@ void loop() {
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint > 900) {
     lastPrint = millis();
-    Serial.printf("[DBG] id=%s link=%s ch=%u rssi=%d ready=%d calib=%d(%u/%u) ema=%.2f send=%.2f off=%d ov=%u gate=%u err=0x%02X end=%u\n",
+    Serial.printf("[DBG] id=%s link=%s ch=%u rssi=%d ready=%d calib=%d ema=%.2f send=%.2f off=%d ov=%u gate=%u err=0x%02X end=%u\n",
                   NODE_ID.c_str(), linkState == LINK_UP ? "UP" : "SCAN", curChannel, lastRssi,
-                  (int)sensorReady, (int)calibrated, calibOkCount, CALIB_NEED_OK,
+                  (int)sensorReady, (int)calibrated,
                   ema, vSend, offsetADC, gateOverride, gateStateNow(), errFlags, endstopBits());
   }
 
