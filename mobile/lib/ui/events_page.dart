@@ -37,7 +37,7 @@ class _EventsPageState extends State<EventsPage> {
     final evs = hub.events.reversed.where((e) => _q.isEmpty || e.text.toLowerCase().contains(_q)).toList();
 
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      const PageHeader('Događaji', 'Šta se dešavalo od pokretanja aplikacije.'),
+      const PageHeader('Događaji', 'Poslednjih 500 događaja. Ostaju sačuvani i kad zatvoriš aplikaciju.'),
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
         child: Row(children: [

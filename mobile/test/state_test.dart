@@ -60,4 +60,20 @@ void main() {
       'B: nova mašina se javila',
     ]);
   });
+
+  test('machine count in Serbian', () {
+    expect(machinesText(1), '1 mašina');
+    expect(machinesText(3), '3 mašine');
+    expect(machinesText(5), '5 mašina');
+    expect(machinesText(12), '12 mašina');
+    expect(machinesText(22), '22 mašine');
+  });
+
+  test('events survive a save and load', () {
+    final e = HubEvent(DateTime(2026, 10, 2, 14, 5, 9), 'warning', 'Glodalica: van mreže');
+    final back = HubEvent.fromJson(e.toJson());
+    expect(back.time, e.time);
+    expect(back.tone, 'warning');
+    expect(back.text, 'Glodalica: van mreže');
+  });
 }

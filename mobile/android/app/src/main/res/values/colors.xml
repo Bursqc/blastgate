@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Same as P.bg of the dark theme: no white flash while the app starts -->
+    <color name="blastgate_bg">#0C161E</color>
+</resources>

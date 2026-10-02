@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'icons.dart';
 import 'theme.dart';
@@ -191,6 +192,7 @@ class SegmentedState extends State<Segmented> {
             borderRadius: BorderRadius.circular(7),
             onTap: widget.enabled
                 ? () {
+                    HapticFeedback.selectionClick();
                     setState(() {
                       _pending = o.key;
                       _pendingAt = DateTime.now();
@@ -417,3 +419,65 @@ Future<bool> confirm(BuildContext context, String title, String text, {String ok
 
 void toast(BuildContext context, String text) =>
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+
+/// Pulsing rings around an icon while the app is looking for something.
+class Radar extends StatefulWidget {
+  final String icon;
+  const Radar({super.key, this.icon = 'access-point'});
+
+  @override
+  State<Radar> createState() => _RadarState();
+}
+
+class _RadarState extends State<Radar> with SingleTickerProviderStateMixin {
+  late final AnimationController _c =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 1800))..repeat();
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+        animation: _c,
+        builder: (_, _) => CustomPaint(
+          painter: _RadarPainter(_c.value, P.accent),
+          child: Center(
+            child: Container(
+              width: 64,
+              height: 64,
+              decoration: BoxDecoration(color: P.navActive, shape: BoxShape.circle),
+              child: Center(child: Ic(widget.icon, P.accent, size: 32)),
+            ),
+          ),
+        ),
+      );
+}
+
+class _RadarPainter extends CustomPainter {
+  final double t;
+  final Color color;
+  _RadarPainter(this.t, this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = size.center(Offset.zero);
+    final maxR = size.shortestSide / 2;
+    for (var i = 0; i < 3; i++) {
+      final p = (t + i / 3) % 1.0;
+      canvas.drawCircle(
+        c,
+        32 + (maxR - 32) * p,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2
+          ..color = color.withValues(alpha: (1 - p) * 0.8),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_RadarPainter o) => o.t != t;
+}

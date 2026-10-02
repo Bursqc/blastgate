@@ -2,17 +2,23 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'services/hub_service.dart';
+import 'services/update_service.dart';
+import 'ui/add_hub_page.dart';
 import 'ui/events_page.dart';
 import 'ui/icons.dart';
 import 'ui/overview_page.dart';
 import 'ui/settings_page.dart';
 import 'ui/system_page.dart';
 import 'ui/theme.dart';
+import 'ui/whats_new.dart';
 
 void main() {
   runApp(
-    ChangeNotifierProvider(
-      create: (_) => HubService()..init(),
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => HubService()..init()),
+        ChangeNotifierProvider(create: (c) => Updater(c.read<HubService>())..init()),
+      ],
       child: const BlastgateApp(),
     ),
   );
@@ -48,6 +54,12 @@ class _ShellState extends State<Shell> {
   int _idx = 0;
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => maybeShowWhatsNew(context));
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
@@ -58,6 +70,16 @@ class _ShellState extends State<Shell> {
           Text('BLASTGATE',
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, letterSpacing: 0.5, color: P.text)),
         ]),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: TextButton.icon(
+              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AddHubPage())),
+              icon: Ic('access-point', P.accent, size: 20),
+              label: Text('Dodaj hub', style: TextStyle(color: P.accent, fontWeight: FontWeight.w600)),
+            ),
+          ),
+        ],
       ),
       body: SafeArea(
         top: false,

@@ -132,6 +132,7 @@ ThemeData buildTheme() {
     switchTheme: SwitchThemeData(
       thumbColor: WidgetStateProperty.resolveWith((s) => s.contains(WidgetState.selected) ? P.accentText : P.muted),
       trackColor: WidgetStateProperty.resolveWith((s) => s.contains(WidgetState.selected) ? P.accent : P.track),
+      trackOutlineColor: WidgetStateProperty.all(P.border),
     ),
     progressIndicatorTheme: ProgressIndicatorThemeData(color: P.accent, linearTrackColor: P.track),
     tabBarTheme: TabBarThemeData(

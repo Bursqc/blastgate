@@ -1,11 +1,16 @@
 import 'package:flutter/material.dart' hide Badge, Banner;
 import 'package:provider/provider.dart';
 
+import '../services/hub_http.dart';
 import '../services/hub_service.dart';
+import '../services/update_service.dart';
 import 'icons.dart';
+import 'add_hub_page.dart';
 import 'node_page.dart';
+import 'pair_page.dart';
 import 'state.dart';
 import 'theme.dart';
+import 'update_page.dart';
 import 'widgets.dart';
 
 /// Pregled — machine tiles + system bar (suction, hub, counts). Port of overview_page.py.
@@ -15,6 +20,7 @@ class OverviewPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final hub = context.watch<HubService>();
+    final up = context.watch<Updater>();
     final st = hub.status;
     final nodes = nodesOf(st);
     final shown = nodes.where((n) => hub.config.showOfflineNodes || isOnline(n)).toList()
@@ -27,13 +33,7 @@ class OverviewPage extends StatelessWidget {
     }
 
     Widget? banner;
-    if (st.isEmpty) {
-      banner = const Banner(
-          'Veza sa hubom nije uspostavljena. Proveri da li je hub uključen i da li je telefon na istoj mreži '
-          '(ili na WiFi-ju BLASTGATE_HUB). Adresu možeš da podesiš u Podešavanjima.',
-          toneName: 'danger',
-          icon: 'wifi-off');
-    } else if (hub.lockout) {
+    if (st.isNotEmpty && hub.lockout) {
       banner = const Banner(
           'Hub je u RUČNOM REŽIMU (MANUAL taster). Svi zatvarači su zatvoreni; otvaraju se tasterima na '
           'mašinama. Hub sam izlazi iz ovog režima kad neka mašina krene.',
@@ -42,9 +42,7 @@ class OverviewPage extends StatelessWidget {
     }
 
     String? empty;
-    if (st.isNotEmpty && nodes.isEmpty) {
-      empty = 'Hub još ne vidi nijednu mašinu.\nUključi nodove — pojaviće se ovde čim se jave.';
-    } else if (shown.isEmpty && nodes.isNotEmpty) {
+    if (shown.isEmpty && nodes.isNotEmpty) {
       empty = 'Sve mašine su van mreže (prikaz offline mašina je isključen u Podešavanjima).';
     }
 
@@ -67,28 +65,147 @@ class OverviewPage extends StatelessWidget {
                   ? const StatusLabel('POVEZAN', 'success')
                   : StatusLabel(hub.searching ? 'TRAŽIM…' : 'NEDOSTUPAN', hub.searching ? 'warning' : 'danger'),
               const Spacer(),
-              Text('${nodes.length} mašina', style: tsMuted(13)),
-              for (final k in ['success', 'warning', 'danger']) ...[
-                const SizedBox(width: 10),
-                Dot(k),
-                const SizedBox(width: 4),
-                Text('${counts[k]}', style: TextStyle(color: P.text, fontSize: 13)),
+              if (nodes.isNotEmpty) ...[
+                Text(machinesText(nodes.length), style: tsMuted(13)),
+                for (final k in ['success', 'warning', 'danger']) ...[
+                  const SizedBox(width: 10),
+                  Dot(k),
+                  const SizedBox(width: 4),
+                  Text('${counts[k]}', style: TextStyle(color: P.text, fontSize: 13)),
+                ],
               ],
             ]),
           ),
+          if (up.appUpdate && !up.appBannerHidden)
+            const Padding(padding: EdgeInsets.fromLTRB(16, 0, 16, 12), child: UpdateStrip(UpdateKind.app)),
+          if (st.isNotEmpty && up.hubUpdate && !up.hubBannerHidden)
+            const Padding(padding: EdgeInsets.fromLTRB(16, 0, 16, 12), child: UpdateStrip(UpdateKind.hub)),
           if (banner != null) Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 12), child: banner),
+          if (st.isEmpty) const Padding(padding: EdgeInsets.fromLTRB(16, 0, 16, 12), child: NoHubCard()),
+          if (st.isNotEmpty) const Padding(padding: EdgeInsets.fromLTRB(16, 0, 16, 12), child: SummaryCard()),
           for (final n in shown)
             Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 12), child: NodeTile(n)),
           if (empty != null)
             Padding(
-              padding: const EdgeInsets.all(32),
+              padding: const EdgeInsets.fromLTRB(32, 24, 32, 12),
               child: Text(empty, textAlign: TextAlign.center, style: tsMuted()),
             ),
-          const Padding(padding: EdgeInsets.fromLTRB(16, 4, 16, 0), child: SummaryCard()),
+          if (st.isNotEmpty && nodes.isEmpty)
+            const Padding(padding: EdgeInsets.fromLTRB(16, 0, 16, 12), child: PairCard()),
+          if (nodes.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+              child: Btn('Dodaj mašinu', icon: 'link', variant: 'outline', expand: true, onTap: () => openPairing(context)),
+            ),
         ],
       ),
     );
   }
+}
+
+/// Shown instead of the machines while no hub answers: what is wrong and what to do.
+class NoHubCard extends StatelessWidget {
+  const NoHubCard({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final hub = context.watch<HubService>();
+    void addHub() => Navigator.push(context, MaterialPageRoute(builder: (_) => const AddHubPage()));
+
+    if (hub.foundHubs.length > 1) {
+      return Section('Pronađeno je više hubova', [
+        Text('Izaberi hub kojim želiš da upravljaš.', style: tsMuted(13)),
+        const SizedBox(height: 10),
+        for (final ip in hub.foundHubs)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Btn('Hub na adresi $ip', icon: 'server', variant: 'outline', expand: true,
+                onTap: () => hub.selectHub(ip)),
+          ),
+      ], inset: false);
+    }
+
+    if (!hub.searchedOnce) {
+      return BgCard(
+        child: Row(children: [
+          const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5)),
+          const SizedBox(width: 14),
+          Expanded(child: Text('Tražim hub na mreži…', style: tsMid())),
+        ]),
+      );
+    }
+
+    return BgCard(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(children: [
+          Ic('wifi-off', tone('danger'), size: 36),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Hub nije pronađen', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: P.text)),
+              Text(hub.searching ? 'Tražim ponovo…' : 'Aplikacija ga sama traži svakih 15 sekundi.', style: tsSmall()),
+            ]),
+          ),
+        ]),
+        const SizedBox(height: 12),
+        Text('Proveri dve stvari:\n1. Hub je uključen.\n2. Telefon je na istoj WiFi mreži kao hub.', style: tsMuted()),
+        const SizedBox(height: 14),
+        Btn('Traži ponovo', icon: 'search', variant: 'primary', expand: true, onTap: hub.searching ? null : hub.findHub),
+        const SizedBox(height: 14),
+        Text('Hub je nov ili resetovan? Dodaj ga preko Bluetooth-a.', style: tsMuted(13)),
+        const SizedBox(height: 8),
+        Btn('Dodaj novi hub', icon: 'access-point', variant: 'outline', expand: true, onTap: addHub),
+      ]),
+    );
+  }
+}
+
+/// Hub is connected but has no machines yet.
+class PairCard extends StatelessWidget {
+  const PairCard({super.key});
+
+  @override
+  Widget build(BuildContext context) => BgCard(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Center(child: Ic('link', P.accent, size: 44)),
+          const SizedBox(height: 10),
+          Text('Još nema mašina', textAlign: TextAlign.center, style: tsSection()),
+          const SizedBox(height: 4),
+          Text('Dodaj prvu mašinu — aplikacija te vodi kroz uparivanje, ime i prag.',
+              textAlign: TextAlign.center, style: tsMuted(13)),
+          const SizedBox(height: 14),
+          Btn('Dodaj mašinu', icon: 'link', variant: 'primary', expand: true, onTap: () => openPairing(context)),
+        ]),
+      );
+}
+
+void openPairing(BuildContext context) =>
+    Navigator.push(context, MaterialPageRoute(builder: (_) => const PairPage()));
+
+/// Ask, then remove the machine from the hub. True when it was removed.
+Future<bool> removeNodeDialog(BuildContext context, String id) async {
+  final hub = context.read<HubService>();
+  final n = hub.node(id);
+  final name = n != null ? nodeName(n) : id;
+  if (!await confirm(
+      context,
+      'Ukloni mašinu',
+      'Ukloniti „$name" sa huba?\n\n'
+          'Hub prestaje da je sluša i briše joj ime. Vraćaš je preko „Dodaj mašinu".',
+      ok: 'Ukloni')) {
+    return false;
+  }
+  try {
+    await hub.removeNode(id);
+    hub.addEvent('info', 'Mašina uklonjena: $name');
+    if (context.mounted) toast(context, '„$name" je uklonjena.');
+    return true;
+  } on HubRejected {
+    if (context.mounted) toast(context, 'Hub ne može da ukloni ovu mašinu: nije uparena sa njim.');
+  } catch (e) {
+    if (context.mounted) toast(context, 'Uklanjanje nije uspelo: $e');
+  }
+  return false;
 }
 
 void openNode(BuildContext context, String id) =>
@@ -177,12 +294,15 @@ class _TileMenu extends StatelessWidget {
             await renameDialog(context, id);
           } else if (a == 'calibrate') {
             Navigator.push(context, MaterialPageRoute(builder: (_) => NodePage(nodeId: id, calibrate: true)));
+          } else if (a == 'remove') {
+            await removeNodeDialog(context, id);
           }
         },
         itemBuilder: (_) => const [
           PopupMenuItem(value: 'open', child: Text('Detalji i upravljanje')),
           PopupMenuItem(value: 'rename', child: Text('Preimenuj…')),
           PopupMenuItem(value: 'calibrate', child: Text('Kalibracija praga…')),
+          PopupMenuItem(value: 'remove', child: Text('Ukloni mašinu…')),
         ],
       );
 }
@@ -210,7 +330,7 @@ Future<void> renameDialog(BuildContext context, String id) async {
   }
 }
 
-/// Bottom bar of the desktop overview: overall state | suction + controls | hub | online | updated.
+/// Overall state + suction control, above the machines (the desktop app has it as a bottom bar).
 class SummaryCard extends StatefulWidget {
   const SummaryCard({super.key});
 
@@ -247,13 +367,18 @@ class _SummaryCardState extends State<SummaryCard> {
 
     String title, sub, t, ic;
     if (st.isEmpty) {
-      (title, sub, t, ic) = ('Hub nije dostupan', 'Tražim hub na mreži…', 'danger', 'alert-circle');
+      (title, sub, t, ic) = ('Hub nije dostupan', 'Upravljanje nije moguće dok se hub ne pronađe', 'danger', 'alert-circle');
+    } else if (nodes.isEmpty) {
+      (title, sub, t, ic) = ('Hub je spreman', 'Još nema dodatih mašina', 'info', 'info-circle');
     } else if (hub.lockout) {
       (title, sub, t, ic) = ('Ručni režim na hubu', 'Zatvaračima se upravlja tasterima', 'warning', 'hand-stop');
     } else if (warn.isNotEmpty || online.length < nodes.length) {
       (title, sub, t, ic) = (
         'Potrebna pažnja',
-        '${nodes.length - online.length} van mreže, ${warn.length} upozorenje',
+        [
+          if (online.length < nodes.length) '${nodes.length - online.length} van mreže',
+          if (warn.isNotEmpty) '${warn.length} sa upozorenjem',
+        ].join(', '),
         'warning',
         'alert-triangle'
       );
@@ -267,7 +392,7 @@ class _SummaryCardState extends State<SummaryCard> {
     return BgCard(
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         Row(children: [
-          Ic(ic, tone(t), size: 40),
+          Ic(ic, tone(t), size: 34),
           const SizedBox(width: 12),
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -276,7 +401,7 @@ class _SummaryCardState extends State<SummaryCard> {
             ]),
           ),
         ]),
-        Divider(color: P.border, height: 24),
+        Divider(color: P.border, height: 20),
         Row(children: [
           Ic('wind', on ? tone('success') : P.muted, size: 22),
           const SizedBox(width: 8),
@@ -299,16 +424,6 @@ class _SummaryCardState extends State<SummaryCard> {
             SegOption('off', 'ISKLJUČI', 'player-stop', 'danger'),
           ],
         ),
-        Divider(color: P.border, height: 24),
-        Row(children: [
-          Expanded(
-              child: IconValue('server', 'Hub', hubLinkText(st, hub.searching),
-                  toneName: st.isNotEmpty ? 'success' : 'danger')),
-          Expanded(
-              child: IconValue('plug-connected', 'Online', st.isNotEmpty ? '${online.length} / ${nodes.length}' : '—')),
-          Expanded(
-              child: IconValue('clock', 'Ažurirano', hub.updatedAt != null ? hhmmss(hub.updatedAt!) : '—')),
-        ]),
       ]),
     );
   }

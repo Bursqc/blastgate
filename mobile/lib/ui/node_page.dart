@@ -5,6 +5,8 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../services/hub_service.dart';
+import 'icons.dart';
+import 'overview_page.dart' show removeNodeDialog;
 import 'state.dart';
 import 'theme.dart';
 import 'widgets.dart';
@@ -198,10 +200,8 @@ class _NodePageState extends State<NodePage> {
     final locked = hub.lockout;
     final can = online && !locked;
     final extra = [
-      id,
-      if (n['transport'] != null) 'veza ${n['transport']}',
-      if (n['fw'] != null) 'FW ${n['fw']}',
-      if (n['mac'] != null) '${n['mac']}',
+      'Oznaka uređaja $id',
+      if (n['fw'] != null) 'verzija ${n['fw']}',
     ];
     final errs = errTexts(toInt(n['err']) & errWarningMask);
     Widget? banner;
@@ -215,7 +215,17 @@ class _NodePageState extends State<NodePage> {
     }
 
     return Scaffold(
-      appBar: AppBar(title: Text('${nodeName(n)} — upravljanje')),
+      appBar: AppBar(title: Text(nodeName(n)), actions: [
+        PopupMenuButton<String>(
+          icon: Ic('dots', P.muted, size: 22),
+          tooltip: 'Opcije',
+          color: P.card,
+          onSelected: (_) async {
+            if (await removeNodeDialog(context, id) && context.mounted) Navigator.pop(context);
+          },
+          itemBuilder: (_) => const [PopupMenuItem(value: 'remove', child: Text('Ukloni mašinu…'))],
+        ),
+      ]),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
         children: [

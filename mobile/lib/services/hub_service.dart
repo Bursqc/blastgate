@@ -7,6 +7,7 @@ import '../models/app_config.dart';
 import '../models/hub_status.dart';
 import '../models/node_status.dart';
 import '../ui/state.dart';
+import 'hub_http.dart';
 
 /// Connection status enum
 enum ConnectionStatus {
@@ -28,6 +29,11 @@ class HubService extends ChangeNotifier {
   Future<void> _cmdTail = Future.value(); // commands run one at a time, in order
   int _cmdPending = 0;
   int _misses = 0;                        // consecutive STATUS timeouts
+  bool _discovering = false;              // a hub search is running
+  DateTime? _lastDiscover;                // when the last search finished
+  List<String> _foundHubs = [];           // more than one hub answered: the user picks
+  bool _persistEvents = false;            // set by init(); tests never touch storage
+  Timer? _eventsSave;
 
   // Raw STATUS JSON (same map the desktop app works with) + derived events
   Map<String, dynamic> _raw = {};
@@ -35,6 +41,7 @@ class HubService extends ChangeNotifier {
   final List<HubEvent> events = [];
   static const int maxEvents = 500;
   static const int missesBeforeOffline = 3;
+  static const _rediscoverEvery = Duration(seconds: 15);
 
   // Getters
   AppConfig get config => _config;
@@ -53,7 +60,10 @@ class HubService extends ChangeNotifier {
   Map<String, dynamic> get status => _raw;
   DateTime? get updatedAt => _updatedAt;
   bool get lockout => _raw.isNotEmpty && toInt(_raw['manualOverdrive']) == 1;
-  bool get searching => _connectionStatus == ConnectionStatus.connecting;
+  bool get searching => _discovering;
+  /// True once a search has finished without a connected hub.
+  bool get searchedOnce => _lastDiscover != null;
+  List<String> get foundHubs => _foundHubs;
 
   Map<String, dynamic>? node(String id) {
     for (final n in nodesOf(_raw)) {
@@ -65,11 +75,46 @@ class HubService extends ChangeNotifier {
   void addEvent(String tone, String text) {
     events.add(HubEvent(DateTime.now(), tone, text));
     if (events.length > maxEvents) events.removeRange(0, events.length - maxEvents);
+    _saveEventsSoon();
+    notifyListeners();
+  }
+
+  /// Events survive an app restart: written a moment after the last change.
+  void _saveEventsSoon() {
+    if (!_persistEvents) return;
+    _eventsSave?.cancel();
+    _eventsSave = Timer(const Duration(seconds: 2), () async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('blastgate_events', jsonEncode([for (final e in events) e.toJson()]));
+      } catch (e) {
+        debugPrint('Error saving events: $e');
+      }
+    });
+  }
+
+  Future<void> _loadEvents() async {
+    try {
+      final raw = (await SharedPreferences.getInstance()).getString('blastgate_events');
+      if (raw == null) return;
+      events.insertAll(0, [for (final j in jsonDecode(raw) as List) HubEvent.fromJson(Map<String, dynamic>.from(j as Map))]);
+    } catch (e) {
+      debugPrint('Error loading events: $e');
+    }
+  }
+
+  /// Tests only: show [status] as if the hub had just answered.
+  @visibleForTesting
+  void debugSetStatus(Map<String, dynamic> status) {
+    _setStatus(status);
+    _updatedAt = status.isEmpty ? null : DateTime(2026, 10, 2, 14, 5, 9);
+    _connectionStatus = status.isEmpty ? ConnectionStatus.disconnected : ConnectionStatus.connected;
     notifyListeners();
   }
 
   void clearEvents() {
     events.clear();
+    _saveEventsSoon();
     notifyListeners();
   }
 
@@ -78,37 +123,52 @@ class HubService extends ChangeNotifier {
     _raw = next;
     events.addAll(evs);
     if (events.length > maxEvents) events.removeRange(0, events.length - maxEvents);
+    if (evs.isNotEmpty) _saveEventsSoon();
   }
 
   /// Initialize the service
   Future<void> init() async {
     await _loadConfig();
+    await _loadEvents();
+    _persistEvents = true;
     await startPolling();
     _startBroadcastListener();
     // Auto-discover hub after short delay (don't block startup)
     Future.delayed(const Duration(milliseconds: 800), _autoDiscoverHub);
   }
 
-  /// Auto-discover hub on startup. If exactly one hub responds and we're not
-  /// already connected, auto-select its IP and restart polling.
+  /// Auto-discover hub on startup (and again while no hub answers).
   Future<void> _autoDiscoverHub() async {
     if (_connectionStatus == ConnectionStatus.connected) return;
+    await findHub();
+  }
+
+  /// Search the network. Exactly one hub: use it. Several: keep the list in
+  /// [foundHubs] for the user to choose from.
+  Future<void> findHub() async {
+    if (_discovering) return;
+    _discovering = true;
+    notifyListeners();
     try {
       final hubs = await discoverHubs();
-      if (hubs.length == 1) {
-        final ip = hubs.first;
-        debugPrint('[AUTO-DISC] Hub found: $ip');
-        _config.preferredHubIp = ip;
-        await saveConfig();
-        await startPolling();
-      } else if (hubs.length > 1) {
-        debugPrint('[AUTO-DISC] Multiple hubs found: $hubs — user must select');
-      } else {
-        debugPrint('[AUTO-DISC] No hub found on startup scan');
-      }
+      debugPrint('[findHub] $hubs');
+      _foundHubs = hubs.length > 1 ? hubs : [];
+      if (hubs.length == 1) await selectHub(hubs.first);
     } catch (e) {
-      debugPrint('[AUTO-DISC] Discovery error: $e');
+      debugPrint('[findHub] error: $e');
+    } finally {
+      _discovering = false;
+      _lastDiscover = DateTime.now();
+      notifyListeners();
     }
+  }
+
+  /// Use the hub at [ip] from now on.
+  Future<void> selectHub(String ip) async {
+    _foundHubs = [];
+    _config.preferredHubIp = ip;
+    await saveConfig();
+    await startPolling();
   }
 
   /// Start listening for HUB_UPDATE broadcasts (real-time sync)
@@ -288,6 +348,9 @@ class HubService extends ChangeNotifier {
           _lastError = 'No response from hub';
           if (_raw.isNotEmpty) _setStatus({});
           _hubStatus = null;
+          // The hub may have a new address (router restart): look for it again
+          final last = _lastDiscover;
+          if (last != null && DateTime.now().difference(last) > _rediscoverEvery) findHub();
         }
         notifyListeners();
         return;
@@ -347,6 +410,14 @@ class HubService extends ChangeNotifier {
       return true;
     }
     return false;
+  }
+
+  /// Remove a machine from the hub: unpair it and drop its saved name.
+  /// Throws when the hub is unreachable or refuses.
+  Future<void> removeNode(String nodeId) async {
+    await HubHttp.unpair(_config.effectiveHubIp, nodeId);
+    await _sendCommand('FORGET id=$nodeId');
+    await fetchStatus();
   }
 
   /// Set node configuration persisted in hub NVS
@@ -591,6 +662,7 @@ class HubService extends ChangeNotifier {
   @override
   void dispose() {
     stopPolling();
+    _eventsSave?.cancel();
     _socket?.close();
     _broadcastSocket?.close();
     _broadcastSocket = null;

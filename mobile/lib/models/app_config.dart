@@ -15,6 +15,7 @@ class AppConfig {
   // OTA settings — match desktop AppConfig
   String otaManifestUrl;
   String otaToken;
+  bool autoDownloadUpdates;   // fetch a new app version by itself on unmetered WiFi
 
   AppConfig({
     this.hubLanIp = '192.168.1.116',
@@ -29,8 +30,12 @@ class AppConfig {
     this.showOfflineNodes = false,
     this.theme = 'dark',
     this.otaManifestUrl = 'https://raw.githubusercontent.com/Bursqc/blastgate/main/releases/manifest.json',
-    this.otaToken = 'blastgate-change-me',
+    this.otaToken = defaultOtaToken,
+    this.autoDownloadUpdates = true,
   });
+
+  /// Token every hub ships with; the app suggests replacing it.
+  static const defaultOtaToken = 'blastgate-change-me';
 
   factory AppConfig.fromJson(Map<String, dynamic> json) {
     return AppConfig(
@@ -47,7 +52,8 @@ class AppConfig {
       theme: json['theme'] as String? ?? 'dark',
       otaManifestUrl: json['otaManifestUrl'] as String? ??
           'https://raw.githubusercontent.com/Bursqc/blastgate/main/releases/manifest.json',
-      otaToken: json['otaToken'] as String? ?? 'blastgate-change-me',
+      otaToken: json['otaToken'] as String? ?? defaultOtaToken,
+      autoDownloadUpdates: json['autoDownloadUpdates'] as bool? ?? true,
     );
   }
 
@@ -66,6 +72,7 @@ class AppConfig {
       'theme': theme,
       'otaManifestUrl': otaManifestUrl,
       'otaToken': otaToken,
+      'autoDownloadUpdates': autoDownloadUpdates,
     };
   }
 

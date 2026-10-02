@@ -308,7 +308,9 @@ class WifiProvisionManager(boss: Boss) : ActionManager(boss) {
       boss.d("provision: start")
       esp.provision(ssid, passphrase, object : ProvisionListener {
         override fun createSessionFailed(e: java.lang.Exception?) {
-          boss.e("wifiprovision createSessionFailed")
+          boss.e("wifiprovision createSessionFailed $e")
+          // without a reply the Dart call would wait forever
+          ctx.result.error("E2", "Session failed", "Exception details $e")
         }
 
         override fun wifiConfigSent() {

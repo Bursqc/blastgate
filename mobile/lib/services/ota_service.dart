@@ -69,6 +69,47 @@ class OtaManifest {
   }
 }
 
+/// One downloadable APK of an app release.
+class ApkFile {
+  final String url;
+  final int size;
+  final String sha256;
+  const ApkFile({required this.url, this.size = 0, this.sha256 = ''});
+
+  factory ApkFile.fromJson(Map<String, dynamic> json) => ApkFile(
+        url: json['url'] as String,
+        size: (json['size'] as num?)?.toInt() ?? 0,
+        sha256: ((json['sha256'] as String?) ?? '').toLowerCase(),
+      );
+}
+
+/// Mobile app release: the optional "app" section of the same manifest.
+/// `apks` is keyed by Android ABI ("arm64-v8a", …) or "universal".
+class AppRelease {
+  final String version;
+  final String changelog;
+  final Map<String, ApkFile> apks;
+  const AppRelease({required this.version, this.changelog = '', this.apks = const {}});
+
+  factory AppRelease.fromJson(Map<String, dynamic> json) => AppRelease(
+        version: json['version'] as String,
+        changelog: (json['changelog'] as String?) ?? '',
+        apks: {
+          for (final e in ((json['apks'] as Map?) ?? const {}).entries)
+            e.key as String: ApkFile.fromJson(Map<String, dynamic>.from(e.value as Map)),
+        },
+      );
+
+  /// Smallest APK that runs on this phone: first matching ABI, else the universal one.
+  ApkFile? apkFor(List<String> abis) {
+    for (final a in abis) {
+      final f = apks[a];
+      if (f != null) return f;
+    }
+    return apks['universal'];
+  }
+}
+
 /// Strips '-rc1' / '+build5' and pads to 3 parts.
 List<int> _semverTuple(String v) {
   final core = v.split('-').first.split('+').first;
@@ -117,7 +158,20 @@ class OtaService {
   /// GET manifest.json from update server.
   /// Adds a cache-bust query param + no-cache headers so GitHub's raw CDN
   /// (max-age=300) doesn't keep us pinned to an old manifest after a release.
-  Future<OtaManifest> fetchRemoteManifest(String manifestUrl) async {
+  Future<OtaManifest> fetchRemoteManifest(String manifestUrl) async =>
+      OtaManifest.fromJson(await _fetchManifestJson(manifestUrl));
+
+  /// Hub firmware + (if the manifest has an "app" section) the mobile app release.
+  Future<({OtaManifest firmware, AppRelease? app})> fetchReleases(String manifestUrl) async {
+    final json = await _fetchManifestJson(manifestUrl);
+    final app = json['app'];
+    return (
+      firmware: OtaManifest.fromJson(json),
+      app: app is Map ? AppRelease.fromJson(Map<String, dynamic>.from(app)) : null,
+    );
+  }
+
+  Future<Map<String, dynamic>> _fetchManifestJson(String manifestUrl) async {
     final sep = manifestUrl.contains('?') ? '&' : '?';
     final bustedUrl = '$manifestUrl${sep}t=${DateTime.now().millisecondsSinceEpoch}';
     final resp = await http.get(
@@ -131,7 +185,7 @@ class OtaService {
     if (resp.statusCode != 200) {
       throw Exception('manifest returned ${resp.statusCode}');
     }
-    return OtaManifest.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
+    return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
   /// Stream firmware.bin into RAM (ESP32 firmware is ~1.5 MB — fine on mobile).

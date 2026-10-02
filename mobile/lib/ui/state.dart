@@ -118,9 +118,25 @@ String relayModeText(Json st) {
 
 String hubLinkText(Json st, bool searching) {
   if (st.isEmpty) return searching ? 'traži hub…' : 'nedostupan';
-  if (toInt(st['ethLink']) == 1) return 'Ethernet';
+  if (toInt(st['ethLink']) == 1) return 'Kabl (LAN)';
   if (toInt(st['sta']) == 1) return 'WiFi';
-  return 'AP (BLASTGATE_HUB)';
+  return 'Direktno na hub';
+}
+
+/// WiFi signal strength in words (RSSI in dBm; 0 = no data).
+String signalWords(int rssi) {
+  if (rssi == 0) return '—';
+  if (rssi > -60) return 'odličan';
+  if (rssi > -70) return 'dobar';
+  if (rssi > -80) return 'slab';
+  return 'vrlo slab';
+}
+
+/// "1 mašina", "3 mašine", "5 mašina".
+String machinesText(int n) {
+  final m10 = n % 10, m100 = n % 100;
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return '$n mašine';
+  return '$n mašina';
 }
 
 String ageText(dynamic ageMs) {
@@ -143,6 +159,11 @@ class HubEvent {
   final String tone;
   final String text;
   const HubEvent(this.time, this.tone, this.text);
+
+  Map<String, dynamic> toJson() => {'t': time.millisecondsSinceEpoch, 'tone': tone, 'text': text};
+
+  factory HubEvent.fromJson(Map<String, dynamic> j) => HubEvent(
+      DateTime.fromMillisecondsSinceEpoch(toInt(j['t'])), j['tone'] as String? ?? 'info', j['text'] as String? ?? '');
 }
 
 /// Human-readable events between two status snapshots.

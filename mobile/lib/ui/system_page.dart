@@ -4,18 +4,19 @@ import 'package:flutter/material.dart' hide Badge, Banner;
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
-import '../screens/ble_prov_screen.dart';
-import '../screens/ota_screen.dart';
-import '../screens/provisioning_screen.dart';
+import '../models/hub_status.dart';
 import '../services/hub_http.dart';
 import '../services/hub_service.dart';
+import '../services/update_service.dart';
+import 'add_hub_page.dart';
 import 'icons.dart';
-import 'overview_page.dart' show openNode;
+import 'overview_page.dart' show openNode, openPairing;
 import 'state.dart';
 import 'theme.dart';
+import 'update_page.dart';
 import 'widgets.dart';
 
-/// Sistem — hub state, machine list, WiFi of the hub, hub firmware. Port of system_page.py.
+/// Sistem — hub state and machine list, WiFi of the hub, updates. Port of system_page.py.
 class SystemPage extends StatelessWidget {
   const SystemPage({super.key});
 
@@ -35,10 +36,10 @@ class SystemPage extends StatelessWidget {
     return DefaultTabController(
       length: 3,
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-        PageHeader('Sistem', 'Stanje huba, mašina, WiFi i firmware.',
+        PageHeader('Sistem', 'Stanje huba i mašina, WiFi huba i ažuriranja.',
             trailing: StatusLabel(overall.$1, overall.$2, size: 13)),
-        const TabBar(tabs: [Tab(text: 'Stanje'), Tab(text: 'WiFi huba'), Tab(text: 'Firmware')]),
-        const Expanded(child: TabBarView(children: [_StateTab(), _WifiTab(), _FwTab()])),
+        const TabBar(tabs: [Tab(text: 'Stanje'), Tab(text: 'WiFi huba'), Tab(text: 'Ažuriranja')]),
+        const Expanded(child: TabBarView(children: [_StateTab(), _WifiTab(), _UpdatesTab()])),
       ]),
     );
   }
@@ -63,32 +64,34 @@ class _StateTabState extends State<_StateTab> {
   Future<void> _refresh(HubService hub) async {
     _set('Osvežavam…');
     await hub.fullRefresh();
-    _set(hub.status.isNotEmpty ? 'Hub osvežen.' : 'Osvežavanje nije uspelo.');
+    _set(hub.status.isNotEmpty ? 'Stanje je osveženo.' : 'Hub ne odgovara.');
   }
 
   Future<void> _reconnect(HubService hub) async {
-    _set('Tražim hub…');
+    _set('Tražim hub na mreži…');
     final hubs = await hub.discoverHubs();
     if (hubs.length == 1) {
-      hub.config.preferredHubIp = hubs.first;
-      hub.updateConfig(hub.config);
-      _set('Hub: ${hubs.first}');
+      await hub.selectHub(hubs.first);
+      _set('Hub pronađen na adresi ${hubs.first}.');
     } else {
-      _set(hubs.isEmpty ? 'Hub nije pronađen.' : 'Pronađeno više hubova: ${hubs.join(', ')} — izaberi u Podešavanjima');
+      _set(hubs.isEmpty
+          ? 'Hub nije pronađen. Proveri da li je uključen i da li je telefon na istoj WiFi mreži.'
+          : 'Pronađeno je više hubova (${hubs.join(', ')}). Adresu izaberi u Podešavanjima.');
     }
   }
 
   Future<void> _ping(HubService hub) async {
-    final ip = hub.config.effectiveHubIp;
+    _set('Proveravam vezu…');
     final sw = Stopwatch()..start();
-    final ok = await hub.testConnection(ip);
-    _set('PING $ip: ${ok ? 'PONG' : 'nema odgovora'} (${sw.elapsedMilliseconds} ms)');
+    final ok = await hub.testConnection(hub.config.effectiveHubIp);
+    _set(ok ? 'Hub odgovara (${sw.elapsedMilliseconds} ms).' : 'Hub ne odgovara.');
   }
 
   Future<void> _diag(HubService hub) async {
     final cfg = hub.config.toJson()..['otaToken'] = '***';
     final b = StringBuffer()
       ..writeln('Blastgate dijagnostika ${DateTime.now().toIso8601String().substring(0, 19)}')
+      ..writeln('Aplikacija: ${context.read<Updater>().appVersion}')
       ..writeln('Hub IP: ${hub.config.effectiveHubIp}  stanje: ${hub.connectionStatus.name}')
       ..writeln('\n== STATUS ==')
       ..writeln(const JsonEncoder.withIndent('  ').convert(hub.status))
@@ -99,7 +102,7 @@ class _StateTabState extends State<_StateTab> {
       b.writeln('${hhmmss(e.time)} ${e.text}');
     }
     await Clipboard.setData(ClipboardData(text: b.toString()));
-    _set('Dijagnostika kopirana u clipboard.');
+    _set('Podaci su kopirani. Nalepi ih u poruku kad tražiš pomoć.');
   }
 
   @override
@@ -108,73 +111,55 @@ class _StateTabState extends State<_StateTab> {
     final st = hub.status;
     final nodes = nodesOf(st)..sort((a, b) => nodeName(a).toLowerCase().compareTo(nodeName(b).toLowerCase()));
     final up = toInt(st['uptime'], -1);
-    final heap = toInt(st['freeHeap'], -1);
-    final hasRadio = st.containsKey('espnow');
-    final esp = toInt(st['espnow']) == 1;
 
     return ListView(padding: const EdgeInsets.all(16), children: [
-      _infoCard('Hub', 'server', st.isNotEmpty ? 'POVEZAN' : 'NEDOSTUPAN', st.isNotEmpty ? 'success' : 'danger', [
-        KV('Adresa', hub.config.effectiveHubIp.isEmpty ? '—' : hub.config.effectiveHubIp),
-        KV('Veza', hubLinkText(st, hub.searching)),
-        KV('Firmware', st['version'] as String? ?? '—'),
-        KV('Radi', up >= 0 ? '${up ~/ 3600} h ${up % 3600 ~/ 60} min' : '—'),
-      ]),
-      const SizedBox(height: 12),
-      _infoCard('Radio veza nodova', 'access-point', hasRadio ? (esp ? 'AKTIVNO' : 'ISKLJUČENO') : 'STARI FW',
-          hasRadio ? (esp ? 'success' : 'warning') : 'idle', [
-        KV('ESP-NOW', hasRadio ? (esp ? 'da' : 'ne') : '— (hub < 1.5.0)'),
-        KV('Kanal', '${st['channel'] ?? '—'}'),
-        KV('Upareno', '${st['pairedCount'] ?? '—'}'),
-      ]),
-      const SizedBox(height: 12),
-      _infoCard('Sinhronizacija', 'refresh', st.isNotEmpty ? 'AKTIVNO' : 'ČEKA', st.isNotEmpty ? 'success' : 'warning', [
-        KV('Osvežavanje', '${hub.config.pollMs} ms'),
-        KV('Poslednji odgovor', hub.updatedAt != null ? hhmmss(hub.updatedAt!) : '—'),
-        KV('Slobodna mem.', heap >= 0 ? '${(heap / 1024).round()} KB' : '—'),
-      ]),
-      const SizedBox(height: 12),
-      Section('Mašine', [
-        if (nodes.isEmpty) Text('—', style: tsMuted()),
-        for (final n in nodes) _nodeRow(context, n),
-      ], inset: false),
-      const SizedBox(height: 12),
-      Section('Sistemske akcije', [
-        Text('Održavanje i dijagnostika.', style: tsMuted(13)),
-        const SizedBox(height: 10),
-        Wrap(spacing: 8, runSpacing: 8, children: [
-          Btn('Osveži status', icon: 'refresh', variant: 'outline', onTap: () => _refresh(hub)),
-          Btn('Ponovo poveži', icon: 'link', variant: 'outline', onTap: () => _reconnect(hub)),
-          Btn('Pošalji test (PING)', icon: 'send', variant: 'outline', onTap: () => _ping(hub)),
-          Btn('Kopiraj dijagnostiku', icon: 'download', variant: 'outline', onTap: () => _diag(hub)),
-        ]),
-        if (_say.isNotEmpty) ...[const SizedBox(height: 8), Text(_say, style: tsSmall())],
-      ], inset: false),
-    ]);
-  }
-
-  Widget _infoCard(String title, String icon, String status, String t, List<Widget> rows) => BgCard(
+      BgCard(
         child: Row(children: [
-          Ic(icon, P.muted, size: 40),
+          Ic('server', P.muted, size: 40),
           const SizedBox(width: 14),
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
               Row(children: [
-                Text(title, style: tsSection()),
+                Text('Hub', style: tsSection()),
                 const SizedBox(width: 10),
-                Flexible(child: StatusLabel(status, t)),
+                Flexible(
+                    child: StatusLabel(
+                        st.isNotEmpty ? 'POVEZAN' : 'NEDOSTUPAN', st.isNotEmpty ? 'success' : 'danger')),
               ]),
               Divider(color: P.border, height: 14),
-              ...rows,
+              KV('Veza', hubLinkText(st, hub.searching)),
+              KV('Adresa', st.isEmpty ? '—' : hub.config.effectiveHubIp),
+              KV('Verzija', st['version'] as String? ?? '—'),
+              if (st.containsKey('pairedCount')) KV('Uparenih mašina', '${st['pairedCount']}'),
+              KV('Radi bez prekida', up >= 0 ? '${up ~/ 3600} h ${up % 3600 ~/ 60} min' : '—'),
             ]),
           ),
         ]),
-      );
+      ),
+      const SizedBox(height: 12),
+      Section('Mašine', [
+        if (nodes.isEmpty) Text(st.isEmpty ? '—' : 'Hub još nema nijednu mašinu.', style: tsMuted()),
+        for (final n in nodes) _nodeRow(context, n),
+      ],
+          trailing: st.isEmpty ? null : Btn('Dodaj', icon: 'link', variant: 'outline', onTap: () => openPairing(context)),
+          inset: false),
+      const SizedBox(height: 12),
+      Section('Provera i pomoć', [
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          Btn('Osveži stanje', icon: 'refresh', variant: 'outline', onTap: () => _refresh(hub)),
+          Btn('Proveri vezu', icon: 'link', variant: 'outline', onTap: () => _ping(hub)),
+          Btn('Pronađi hub ponovo', icon: 'search', variant: 'outline', onTap: () => _reconnect(hub)),
+          Btn('Kopiraj podatke za podršku', icon: 'download', variant: 'outline', onTap: () => _diag(hub)),
+        ]),
+        if (_say.isNotEmpty) ...[const SizedBox(height: 10), Text(_say, style: tsMuted(13))],
+      ], inset: false),
+    ]);
+  }
 
   Widget _nodeRow(BuildContext context, Json n) {
     final (s, t) = nodeStatus(n);
     final manual = toInt(n['mode']) == 1;
     final open = gateOpen(n);
-    final link = const {'espnow': 'ESP-NOW', 'udp': 'WiFi (UDP)'}[n['transport']] ?? 'WiFi (UDP)';
     return InkWell(
       onTap: () => openNode(context, n['id'] as String),
       child: Padding(
@@ -186,7 +171,7 @@ class _StateTabState extends State<_StateTab> {
           ]),
           const SizedBox(height: 4),
           Wrap(spacing: 14, runSpacing: 4, crossAxisAlignment: WrapCrossAlignment.center, children: [
-            Text('${n['id']} · $link', style: tsSmall()),
+            Text('${n['id']}', style: tsSmall()),
             Text(manual ? 'MANUAL' : 'AUTO', style: TextStyle(fontSize: 12, color: tone(manual ? 'warning' : 'info'))),
             Text(gateText(n),
                 style: TextStyle(fontSize: 12, color: tone(isOnline(n) ? (open ? 'success' : 'danger') : 'idle'))),
@@ -209,12 +194,9 @@ class _WifiTab extends StatefulWidget {
 }
 
 class _WifiTabState extends State<_WifiTab> {
-  final _ssid = TextEditingController();
-  final _pass = TextEditingController();
-  bool _show = false;
-  List<String> _nets = [];
-  (String, String) _state = ('—', 'idle');
-  String _detail = '';
+  WifiInfo? _wifi;
+  bool _loaded = false;
+  bool _wasConnected = false;
   Msg _msg;
 
   @override
@@ -223,178 +205,149 @@ class _WifiTabState extends State<_WifiTab> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
   }
 
-  @override
-  void dispose() {
-    _ssid.dispose();
-    _pass.dispose();
-    super.dispose();
-  }
-
   HubService get hub => context.read<HubService>();
   String get ip => hub.config.effectiveHubIp;
-
-  void _say(String text, String t, String icon) {
-    if (mounted) setState(() => _msg = (text, t, icon));
-  }
 
   Future<void> _refresh() async {
     final w = await hub.getWifiInfo();
     if (!mounted) return;
     setState(() {
-      if (w == null) {
-        _state = ('Greška: hub ne odgovara', 'danger');
-        _detail = '';
-      } else {
-        _state = w.connected ? ('POVEZAN', 'success') : ('NIJE POVEZAN', 'warning');
-        _detail = 'Mreža: ${w.ssid.isEmpty ? '—' : w.ssid}   IP: ${w.ip.isEmpty ? '—' : w.ip}   '
-            'Signal: ${w.rssi == 0 ? '—' : w.rssi} dBm';
-      }
+      _wifi = w;
+      _loaded = true;
     });
   }
 
-  Future<void> _scan() async {
-    if (hub.status.isEmpty) {
-      _say('Hub nije dostupan.', 'danger', 'alert-circle');
-      return;
-    }
-    _say('Skeniram mreže (hub blokira ~2 s)…', 'info', 'search');
-    try {
-      final nets = await HubHttp.wifiScan(ip);
-      if (!mounted) return;
-      setState(() => _nets = nets.map((n) => n['ssid'] as String).toSet().toList());
-      _say('Pronađeno mreža: ${_nets.length}', 'info', 'wifi');
-    } catch (e) {
-      _say('Skeniranje nije uspelo: $e', 'danger', 'alert-circle');
-    }
-  }
-
-  Future<void> _set() async {
-    final ssid = _ssid.text.trim();
-    if (ssid.isEmpty || hub.status.isEmpty) {
-      _say('Unesi mrežu (i proveri da je hub dostupan).', 'warning', 'alert-triangle');
-      return;
-    }
-    if (!await confirm(context, 'WiFi huba', 'Poslati hubu mrežu „$ssid”?\nHub će se restartovati.')) return;
-    try {
-      await HubHttp.wifiSet(ip, ssid, _pass.text);
-      hub.addEvent('info', 'WiFi huba → $ssid');
-      _say('Poslato. Hub se restartuje i povezuje na WiFi.', 'success', 'circle-check');
-    } catch (e) {
-      _say('Greška: $e', 'danger', 'alert-circle');
-    }
-  }
-
-  Future<void> _disconnect() async {
-    if (!await confirm(context, 'WiFi huba', 'Prekinuti WiFi vezu huba (podaci ostaju sačuvani)?\nHub se restartuje.')) {
-      return;
-    }
-    final r = await hub.command('WIFI_DISCONNECT');
-    r != null && r.contains('OK')
-        ? _say('Hub se restartuje.', 'info', 'info-circle')
-        : _say('Greška: ${r ?? 'hub ne odgovara'}', 'danger', 'alert-circle');
+  Future<void> _change() async {
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => AddHubPage(hubIp: ip)));
+    if (mounted) _refresh();
   }
 
   Future<void> _forget() async {
     if (!await confirm(
         context,
         'Zaboravi WiFi',
-        'Hub će zaboraviti WiFi mrežu i restartovati se.\n'
-            'Posle toga je dostupan samo preko Etherneta ili BLASTGATE_HUB.\n\nNastaviti?',
+        'Hub briše sačuvanu WiFi mrežu i restartuje se.\n\n'
+            'Posle toga ga ponovo dodaješ preko „Dodaj hub" (Bluetooth).',
         ok: 'Zaboravi')) {
       return;
     }
     try {
       await HubHttp.wifiForget(ip);
-      _say('WiFi zaboravljen, hub se restartuje.', 'info', 'info-circle');
+      hub.addEvent('info', 'Hub je zaboravio WiFi mrežu');
+      if (mounted) {
+        setState(() => _msg = ('Hub je zaboravio WiFi i restartuje se. Dodaj ga ponovo preko „Dodaj hub".', 'info',
+            'info-circle'));
+      }
     } catch (e) {
-      _say('Greška: $e', 'danger', 'alert-circle');
+      if (mounted) setState(() => _msg = ('Nije uspelo: $e', 'danger', 'alert-circle'));
     }
   }
 
   @override
-  Widget build(BuildContext context) => ListView(padding: const EdgeInsets.all(16), children: [
-        Section('Trenutna WiFi veza huba', [
-          StatusLabel(_state.$1, _state.$2, size: 13),
-          const SizedBox(height: 4),
-          Text(_detail, style: tsMuted(13)),
-        ], trailing: IconButton(onPressed: _refresh, icon: Ic('refresh', P.muted)), inset: false),
+  Widget build(BuildContext context) {
+    final connected = context.watch<HubService>().status.isNotEmpty;
+    // Re-read the WiFi state whenever the hub comes back (e.g. after a restart)
+    if (connected != _wasConnected) {
+      _wasConnected = connected;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
+    }
+    final w = _wifi;
+    final onWifi = connected && w != null && w.connected;
+
+    return ListView(padding: const EdgeInsets.all(16), children: [
+      Section('WiFi mreža huba', [
+        if (!connected) ...[
+          const StatusLabel('HUB NIJE DOSTUPAN', 'danger', size: 13),
+          const SizedBox(height: 6),
+          Text('WiFi huba može da se promeni tek kad aplikacija vidi hub.', style: tsMuted(13)),
+        ] else if (!_loaded || w == null) ...[
+          Text(_loaded ? 'Hub nije poslao podatke o WiFi-ju.' : 'Učitavam…', style: tsMuted(13)),
+        ] else ...[
+          StatusLabel(onWifi ? 'POVEZAN' : 'NIJE POVEZAN NA WIFI', onWifi ? 'success' : 'warning', size: 13),
+          const SizedBox(height: 6),
+          if (onWifi) ...[
+            KV('Mreža', w.ssid.isEmpty ? '—' : w.ssid),
+            KV('Signal', w.rssi == 0 ? '—' : '${signalWords(w.rssi)} (${w.rssi} dBm)'),
+            KV('Adresa', w.ip.isEmpty ? '—' : w.ip),
+          ] else
+            Text('Hub trenutno radi bez WiFi mreže (preko kabla ili direktno).', style: tsMuted(13)),
+        ],
         const SizedBox(height: 12),
-        Section('Poveži hub na WiFi', [
-          Text('Telefon mora biti na istoj mreži kao hub ili na WiFi-ju BLASTGATE_HUB (lozinka 12345678). '
-              'Hub se posle slanja restartuje.', style: tsMuted(13)),
-          const SizedBox(height: 12),
-          Row(children: [
-            Expanded(child: TextField(controller: _ssid, decoration: const InputDecoration(labelText: 'Mreža (SSID)'))),
-            const SizedBox(width: 8),
-            Btn('Skeniraj', icon: 'search', onTap: _scan),
-          ]),
-          if (_nets.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Wrap(spacing: 6, runSpacing: 6, children: [
-                for (final s in _nets)
-                  ActionChip(
-                    label: Text(s),
-                    backgroundColor: P.cardHi,
-                    side: BorderSide(color: s == _ssid.text ? P.accent : P.border),
-                    onPressed: () => setState(() => _ssid.text = s),
-                  ),
-              ]),
-            ),
-          const SizedBox(height: 10),
-          TextField(
-            controller: _pass,
-            obscureText: !_show,
-            decoration: InputDecoration(
-              labelText: 'Lozinka',
-              suffixIcon: IconButton(
-                icon: Ic(_show ? 'eye-off' : 'eye', P.muted, size: 20),
-                onPressed: () => setState(() => _show = !_show),
-              ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Btn('Pošalji hubu', icon: 'send', variant: 'primary', expand: true, onTap: _set),
-          msgBanner(_msg),
-          const SizedBox(height: 12),
-          Wrap(spacing: 8, runSpacing: 8, children: [
-            Btn('Prekini WiFi vezu', icon: 'wifi-off', onTap: _disconnect),
-            Btn('Zaboravi WiFi', icon: 'trash', variant: 'danger', onTap: _forget),
-          ]),
-        ], inset: false),
-        const SizedBox(height: 12),
-        Section('Hub još nije na WiFi-ju?', [
-          Text('Podesi ga preko Bluetooth-a (hub u BLE režimu) ili preko njegove WiFi mreže BLASTGATE_HUB.',
-              style: tsMuted(13)),
-          const SizedBox(height: 10),
-          Wrap(spacing: 8, runSpacing: 8, children: [
-            Btn('Preko Bluetooth-a', icon: 'access-point', variant: 'outline',
-                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BleProvScreen()))),
-            Btn('Preko BLASTGATE_HUB', icon: 'world', variant: 'outline',
-                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ProvisioningScreen()))),
-          ]),
-        ], inset: false),
-      ]);
+        Btn(onWifi ? 'Promeni WiFi mrežu' : 'Poveži hub na WiFi',
+            icon: 'wifi', variant: 'primary', expand: true, onTap: connected ? _change : null),
+        msgBanner(_msg),
+      ], trailing: IconButton(onPressed: _refresh, tooltip: 'Osveži', icon: Ic('refresh', P.muted)), inset: false),
+      const SizedBox(height: 12),
+      Section('Hub je nov ili se ne vidi?', [
+        Text('Nov ili resetovan hub dodaješ preko Bluetooth-a: aplikacija ga nađe, ti izabereš mrežu i ukucaš šifru.',
+            style: tsMuted(13)),
+        const SizedBox(height: 10),
+        Btn('Dodaj hub', icon: 'access-point', variant: 'outline', expand: true,
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AddHubPage()))),
+      ], inset: false),
+      const SizedBox(height: 12),
+      Section('Zaboravi WiFi', [
+        Text('Koristi kad hub seliš na drugo mesto ili ga daješ nekom drugom. Hub briše sačuvanu mrežu.',
+            style: tsMuted(13)),
+        const SizedBox(height: 10),
+        Btn('Zaboravi WiFi', icon: 'trash', variant: 'danger', onTap: connected ? _forget : null),
+      ], inset: false),
+    ]);
+  }
 }
 
-// ================================================================== Firmware
+// ================================================================ Ažuriranja
 
-class _FwTab extends StatelessWidget {
-  const _FwTab();
+class _UpdatesTab extends StatelessWidget {
+  const _UpdatesTab();
 
   @override
   Widget build(BuildContext context) {
-    final st = context.watch<HubService>().status;
+    final up = context.watch<Updater>();
+    final connected = context.watch<HubService>().status.isNotEmpty;
+
+    Widget card(String title, String installed, String? latest, bool update, UpdateKind kind,
+        {String unknown = ''}) {
+      final (String, String) state = update
+          ? ('IMA NOVA VERZIJA', 'info')
+          : latest == null || installed.isEmpty
+              ? ('NIJE PROVERENO', 'idle')
+              : ('AŽURNO', 'success');
+      return Section(title, [
+        KV('Instalirana verzija', installed.isEmpty ? '—' : installed),
+        KV('Najnovija verzija', latest ?? '—'),
+        if (unknown.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 4), child: Text(unknown, style: tsSmall())),
+        if (update) ...[
+          const SizedBox(height: 12),
+          if (kind == UpdateKind.app && up.downloading)
+            Text('Preuzimam novu verziju…', style: tsMuted(13))
+          else
+            Btn(kind == UpdateKind.app && up.apk != null ? 'Instaliraj $latest' : 'Ažuriraj na $latest',
+                icon: 'download', variant: 'primary', expand: true,
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => UpdatePage(kind)))),
+        ],
+      ], trailing: StatusLabel(state.$1, state.$2), inset: false);
+    }
+
     return ListView(padding: const EdgeInsets.all(16), children: [
-      Section('Ažuriranje firmware-a huba (OTA)', [
-        Text('Nova verzija se skida sa servera za izdanja, proverava se SHA256 i šalje hubu. '
-            'Hub se posle toga sam restartuje.', style: tsMuted(13)),
+      card('Aplikacija', up.appVersion, up.app?.version, up.appUpdate, UpdateKind.app),
+      const SizedBox(height: 12),
+      card('Hub', connected ? up.hubVersion : '', up.firmware?.version, connected && up.hubUpdate,
+          UpdateKind.hub,
+          unknown: connected ? '' : 'Hub nije dostupan, pa se njegova verzija ne vidi.'),
+      const SizedBox(height: 12),
+      Section('Provera', [
+        Text(
+            up.checking
+                ? 'Proveravam…'
+                : up.checkFailed
+                    ? 'Provera nije uspela. Telefon nema pristup internetu.'
+                    : up.checkedAt != null
+                        ? 'Poslednja provera: ${hhmmss(up.checkedAt!)}. Aplikacija proverava sama pri pokretanju.'
+                        : 'Još nije provereno.',
+            style: tsMuted(13)),
         const SizedBox(height: 10),
-        KV('Verzija na hubu', st['version'] as String? ?? '—'),
-        KV('Build huba', st['build'] as String? ?? '—'),
-        const SizedBox(height: 12),
-        Btn('Proveri i ažuriraj', icon: 'upload', variant: 'primary', expand: true,
-            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const OtaScreen()))),
+        Btn('Proveri sada', icon: 'refresh', variant: 'outline', expand: true, onTap: up.checking ? null : up.check),
       ], inset: false),
     ]);
   }
